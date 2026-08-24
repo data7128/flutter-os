@@ -1,55 +1,44 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# AeroOS one-command build script.
-# Builds the kernel, the bootable OS image, and (optionally) the Flutter shell.
+# ──────────────────────────────────────────────────────────
+#  AeroOS build script
+#  Builds the kernel and a bootable BIOS disk image.
+# ──────────────────────────────────────────────────────────
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
+
+export PATH="$HOME/.cargo/bin:$PATH"
 
 echo "═══════════════════════════════════════════════"
 echo "  AeroOS Build"
 echo "═══════════════════════════════════════════════"
 
-# ── 1. Rust kernel ─────────────────────────────
+# ── 1. Build kernel + BIOS disk image ──────────────────
 echo ""
-echo "[1/3] Building Rust kernel..."
-cd kernel
-cargo build
-cd ..
+echo "[1/2] Building kernel and BIOS disk image..."
+cargo build -p aeros-os --release
 
-# ── 2. Bootable OS image ──────────────────────
+# ── 2. Copy the disk image to a stable path ────────────
 echo ""
-echo "[2/3] Building bootable OS image..."
-cd os
-cargo build
-cd ..
+echo "[2/2] Running image builder..."
+IMAGE="target/aeros-os-bios.img"
+cargo run -p aeros-os --release --quiet
 
-IMAGE="os/target/x86_64-unknown-none/debug/aeros-os"
 if [ -f "$IMAGE" ]; then
-    echo "  ✓ Image: $IMAGE ($(du -h "$IMAGE" | cut -f1))"
-fi
-
-# ── 3. Flutter shell (optional) ───────────────
-if command -v flutter &> /dev/null; then
     echo ""
-    echo "[3/3] Building Flutter shell..."
-    cd shell
-    flutter pub get
-    cd ..
-    echo "  ✓ Flutter shell ready (run: cd shell && flutter run -d linux)"
+    echo "  ✓ Disk image: $IMAGE ($(du -h "$IMAGE" | cut -f1))"
+    echo ""
+    echo "═══════════════════════════════════════════════"
+    echo "  Build complete!"
+    echo ""
+    echo "  Run in QEMU:"
+    echo "    qemu-system-x86_64 \\"
+    echo "      -drive format=raw,file=$IMAGE \\"
+    echo "      -serial stdio"
+    echo "═══════════════════════════════════════════════"
 else
-    echo ""
-    echo "[3/3] Flutter SDK not found; skipping shell build."
+    echo "  ✗ Disk image not found at $IMAGE"
+    exit 1
 fi
-
-# ── Summary ───────────────────────────────────
-echo ""
-echo "═══════════════════════════════════════════════"
-echo "  Build complete!"
-echo ""
-echo "  Run in QEMU:"
-echo "    qemu-system-x86_64 \\"
-echo "      -drive format=raw,file=$IMAGE \\"
-echo "      -serial stdio"
-echo "═══════════════════════════════════════════════"

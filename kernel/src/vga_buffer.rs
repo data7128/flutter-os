@@ -1,17 +1,14 @@
-//! VGA text-mode buffer (0xB8000).
+//! VGA text-mode buffer (0xB8000 physical).
 //!
-//! A classic 80x25 color text buffer used for the early boot log before
-//! the framebuffer shell is up. `_print` is shared with the serial console
-//! through the `print!`/`println!` macros.
-//!
-//! We use raw volatile pointer operations (`core::ptr::write_volatile` /
-//! `read_volatile`) instead of the `volatile` crate so that the static
-//! initializer avoids creating a dangling reference at compile time
-//! (nightly Rust's provenance check rejects `&mut *(0xb8000 as *mut _)`
-//! in a `const` context).
+//! A classic 80x25 color text buffer. Because the bootloader maps physical
+//! memory at a dynamic offset, the buffer's virtual address is
+//! `0xB8000 + physical_memory_offset`. The `init()` function must be called
+//! with the offset (from `BootInfo`) before any VGA writes occur; before that,
+//! `_print` is a no-op so early serial-only output never faults.
 
 use core::fmt::{self, Write};
 use core::ptr;
+use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Mutex;
 
 /// The standard 16-color VGA palette.
@@ -59,17 +56,19 @@ struct ScreenChar {
 const BUFFER_HEIGHT: usize = 25;
 const BUFFER_WIDTH: usize = 80;
 
-/// The VGA text buffer lives at this fixed physical address.
-const VGA_BUFFER_ADDR: usize = 0xb8000;
+/// Physical address of the VGA text buffer.
+const VGA_BUFFER_PHYS: u64 = 0xb8000;
+
+/// Whether `init()` has been called and VGA is safe to use.
+static VGA_READY: AtomicBool = AtomicBool::new(false);
 
 /// A view over the 25x80 screen, wrapped in a spinlock so interrupts can
-/// also write safely. The buffer is a raw pointer to avoid creating a
-/// dangling reference in const context.
-pub static WRITER: Mutex<Writer> = Mutex::new(Writer {
+/// also write safely.
+static WRITER: Mutex<Writer> = Mutex::new(Writer {
     column_position: 0,
     row_position: 0,
     color_code: ColorCode::new(Color::LightGreen, Color::Black),
-    buffer: VGA_BUFFER_ADDR as *mut ScreenChar,
+    buffer: 0xb8000 as *mut ScreenChar, // overwritten by init()
 });
 
 pub struct Writer {
@@ -160,18 +159,37 @@ impl Write for Writer {
     }
 }
 
+/// Initialise the VGA buffer with the physical memory offset provided by
+/// the bootloader. Must be called before any VGA output.
+pub fn init(phys_offset: u64) {
+    let virt = VGA_BUFFER_PHYS + phys_offset;
+    {
+        let mut writer = WRITER.lock();
+        writer.buffer = virt as *mut ScreenChar;
+    }
+    VGA_READY.store(true, Ordering::SeqCst);
+    // Clear the screen.
+    for row in 0..BUFFER_HEIGHT {
+        WRITER.lock().clear_row(row);
+    }
+}
+
 /// Low-level entry point used by the `print!` macro. Acquires the writer
-/// and forwards the formatted arguments.
+/// and forwards the formatted arguments. No-ops until `init()` is called.
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
-    use core::fmt::Write;
-    WRITER.lock().write_fmt(args).unwrap();
+    if VGA_READY.load(Ordering::SeqCst) {
+        use core::fmt::Write;
+        let _ = WRITER.lock().write_fmt(args);
+    }
 }
 
 /// Clear the whole screen.
 #[allow(dead_code)]
 pub fn clear_screen() {
-    for row in 0..BUFFER_HEIGHT {
-        WRITER.lock().clear_row(row);
+    if VGA_READY.load(Ordering::SeqCst) {
+        for row in 0..BUFFER_HEIGHT {
+            WRITER.lock().clear_row(row);
+        }
     }
 }

@@ -3,7 +3,7 @@ name = "aeros-kernel"
 version = "0.1.0"
 edition = "2021"
 authors = ["flutter-os contributors"]
-description = "AeroOS freestanding x86_64 kernel (Rust runtime + Flutter shell)"
+description = "Minimal x86_64 bare-metal kernel (no_std, bootloader 0.11)"
 license = "MIT"
 
 [dependencies]
@@ -14,7 +14,3 @@ pic8259 = "0.10"
 uart_16550 = "0.3"
 lazy_static = { version = "1.4", features = ["spin_no_std"] }
 linked_list_allocator = "0.10"
-log = "0.4"
-
-[features]
-default = []

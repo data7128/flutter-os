@@ -30,22 +30,26 @@ lazy_static! {
         tss
     };
 
-    static ref GDT: (GlobalDescriptorTable, SegmentSelector, SegmentSelector) = {
+    static ref GDT: (GlobalDescriptorTable, SegmentSelector, SegmentSelector, SegmentSelector) = {
         let mut gdt = GlobalDescriptorTable::new();
         let code = gdt.append(Descriptor::kernel_code_segment());
+        let data = gdt.append(Descriptor::kernel_data_segment());
         let tss = gdt.append(Descriptor::tss_segment(&*TSS));
-        (gdt, code, tss)
+        (gdt, code, data, tss)
     };
 }
 
-/// Load the GDT, refresh the code segment and install the TSS.
+/// Load the GDT, refresh code + data segments and install the TSS.
 pub fn init() {
-    use x86_64::instructions::segmentation::{CS, Segment};
+    use x86_64::instructions::segmentation::{CS, DS, ES, SS, Segment};
     use x86_64::instructions::tables::load_tss;
 
     GDT.0.load();
     unsafe {
         CS::set_reg(GDT.1);
-        load_tss(GDT.2);
+        SS::set_reg(GDT.2);
+        DS::set_reg(GDT.2);
+        ES::set_reg(GDT.2);
+        load_tss(GDT.3);
     }
 }

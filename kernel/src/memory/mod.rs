@@ -1,43 +1,33 @@
 //! Kernel heap allocator.
 //!
-//! The bootloader maps the whole physical address space at
-//! `physical_memory_offset` (when `map-physical-memory` is enabled in the
-//! bootloader config). We pick the first large enough *Usable* region,
-//! translate it to its virtual address (`region.start + offset`) and seed a
-//! linked-list allocator over a 1 MiB slice. This gives the kernel a working
-//! `alloc` without re-implementing paging from scratch.
+//! Uses a static byte array as the heap backing store. This avoids the need
+//! for the bootloader to map all physical memory (which would conflict with
+//! the kernel's own virtual address space). The 1 MiB heap is more than
+//! sufficient for a minimal kernel.
 
-use bootloader_api::info::{MemoryRegion, MemoryRegionKind};
-use bootloader_api::BootInfo;
 use linked_list_allocator::LockedHeap;
 
 /// Size of the kernel heap.
 pub const HEAP_SIZE: usize = 1024 * 1024; // 1 MiB
+
+/// Static backing store for the heap. Linked into the kernel's BSS section.
+static mut HEAP: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
 
 /// Global allocator backed by a linked list of free blocks.
 #[global_allocator]
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
 
 /// Set up the heap. Called once from `kernel_main`.
-pub fn init(boot_info: &mut BootInfo) {
-    let phys_offset = boot_info
-        .physical_memory_offset
-        .into_option()
-        .expect("[memory] bootloader did not map physical memory (enable `map-physical-memory`)");
-
-    let region = boot_info
-        .memory_regions
-        .iter()
-        .find(|r: &&MemoryRegion| {
-            r.kind == MemoryRegionKind::Usable && (r.end - r.start) >= HEAP_SIZE as u64
-        })
-        .expect("[memory] no usable memory region large enough for the heap");
-
-    // The region is reported Usable by the firmware and is not used by the
-    // bootloader, so using it as the heap backing store is sound.
-    let heap_virt = region.start + phys_offset;
-
+///
+/// Uses a static array as the backing store, so no BootInfo or physical
+/// memory mapping is required.
+pub fn init() {
+    // SAFETY: `HEAP` is a static array that exists for the entire lifetime of
+    // the kernel. `init` is called exactly once from `kernel_main` before any
+    // allocation occurs. The `LockedHeap` implementation ensures thread-safe
+    // access via a spinlock.
     unsafe {
-        ALLOCATOR.lock().init(heap_virt as *mut u8, HEAP_SIZE);
+        let heap_start = core::ptr::addr_of_mut!(HEAP) as *mut u8;
+        ALLOCATOR.lock().init(heap_start, HEAP_SIZE);
     }
 }

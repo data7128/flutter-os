@@ -1,6 +1,19 @@
+[package]
+name = "aeros-os"
+version = "0.1.0"
+edition = "2021"
+authors = ["flutter-os contributors"]
+description = "Minimal x86_64 bare-metal OS: Rust kernel + BIOS bootloader disk image"
+
+[dependencies]
+bootloader = { version = "0.11", default-features = false, features = ["bios"] }
+
+[build-dependencies]
+bootloader = { version = "0.11", default-features = false, features = ["bios"] }
+aeros-kernel = { path = "kernel", artifact = "bin", target = "x86_64-unknown-none" }
+
 [workspace]
-members = ["kernel", "os"]
-resolver = "2"
+members = ["kernel"]
 
 [profile.dev]
 panic = "abort"
