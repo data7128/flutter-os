@@ -21,7 +21,7 @@
 set -euo pipefail
 
 IMAGE="${1:-target/aeros-os-bios.img}"
-TIMEOUT_SEC=30
+TIMEOUT_SEC=60
 
 OUTPUT_FILE=$(mktemp)
 
@@ -50,6 +50,9 @@ timeout "${TIMEOUT_SEC}" qemu-system-x86_64 \
     -display none \
     -no-reboot \
     -monitor none \
+    -device usb-uhci \
+    -usbdevice keyboard \
+    -usbdevice mouse \
     2>&1 | tee "${OUTPUT_FILE}" || true
 
 echo ""

@@ -187,10 +187,12 @@ impl UhciController {
         self.write16(regs::USBCMD, cmd::HCRESET);
 
         // Wait for reset to complete (poll for HCRESET to clear).
+        // In TCG software emulation, loops are very slow, so keep
+        // the iteration count modest.
         let mut timeout = 0u32;
         while (self.read16(regs::USBCMD) & cmd::HCRESET) != 0 {
             timeout += 1;
-            if timeout > 100000 {
+            if timeout > 1000 {
                 crate::serial::_print(format_args!(
                     "[uhci] reset timeout!\n"
                 ));
@@ -240,7 +242,8 @@ impl UhciController {
                 self.write16(port_reg, port::RESET);
 
                 // Wait ~50ms (simplified: busy-wait).
-                for _ in 0..100000 { x86_64::instructions::nop(); }
+                // Reduced for TCG CI compatibility.
+                for _ in 0..1000 { x86_64::instructions::nop(); }
 
                 // Clear port reset.
                 self.write16(port_reg, 0);
