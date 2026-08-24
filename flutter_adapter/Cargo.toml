@@ -17,11 +17,3 @@ license = "MIT"
 # Ring3 kernel. Enabled by default during development.
 default = ["skeleton"]
 skeleton = []
-
-[profile.dev]
-panic = "abort"
-
-[profile.release]
-panic = "abort"
-lto = true
-opt-level = 3

@@ -6,8 +6,6 @@
 //!
 //! All GUI logic is here — the kernel has zero window awareness.
 
-use crate::syscalls;
-
 /// Maximum windows the WM can manage simultaneously.
 pub const MAX_WINDOWS: usize = 16;
 
@@ -289,7 +287,7 @@ impl WindowList {
     }
 
     /// Iterate windows in Z-order (bottom to top).
-    pub fn iter_z_order(&self) -> ZOrderIter {
+    pub fn iter_z_order(&self) -> ZOrderIter<'_> {
         // Collect indices and sort by z_order.
         let mut indices: [usize; MAX_WINDOWS] = [0; MAX_WINDOWS];
         let mut n = 0;

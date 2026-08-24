@@ -13,11 +13,3 @@ license = "MIT"
 default = ["skeleton"]
 # Skeleton mode: provides fallback rendering when syscalls return ENOSYS.
 skeleton = []
-
-[profile.dev]
-panic = "abort"
-
-[profile.release]
-panic = "abort"
-lto = true
-opt-level = 3

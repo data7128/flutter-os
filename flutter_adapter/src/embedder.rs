@@ -29,8 +29,7 @@
 //! - libc compatibility layer exists
 //! - pthread support is available
 
-use crate::framebuffer::Color;
-use crate::input::{InputEvent, PointerPhase};
+use crate::input::PointerPhase;
 
 // ── Flutter Engine C API types (re-defined from flutter_embedder.h) ───
 

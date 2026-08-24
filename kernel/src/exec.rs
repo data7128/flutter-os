@@ -19,8 +19,6 @@
 //! - Ring3 page table setup: 【必须人工开发】
 //! - Ring3 context switch: 【必须人工开发】
 
-use core::slice;
-
 /// ELF magic: 0x7F 'E' 'L' 'F'
 const ELF_MAGIC: [u8; 4] = [0x7F, b'E', b'L', b'F'];
 

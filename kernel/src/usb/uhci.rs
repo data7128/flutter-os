@@ -165,12 +165,14 @@ impl UhciController {
     }
 
     /// Read a 32-bit UHCI register.
+    #[allow(dead_code)]
     unsafe fn read32(&self, offset: u16) -> u32 {
         let mut port = Port::new(self.io_base + offset);
         port.read()
     }
 
     /// Write a 32-bit UHCI register.
+    #[allow(dead_code)]
     unsafe fn write32(&self, offset: u16, value: u32) {
         let mut port = Port::new(self.io_base + offset);
         port.write(value);

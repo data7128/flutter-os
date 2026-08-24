@@ -14,7 +14,6 @@
 //! - WM + Shell launch: 【暂未实现 — 等待 Ring3】
 
 use crate::process;
-use crate::syscalls::Errno;
 
 /// Launch the system boot sequence: WM → Flutter Shell.
 ///

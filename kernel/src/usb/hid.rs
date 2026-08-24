@@ -21,7 +21,6 @@
 
 use crate::interrupts::SCANCODE_BUFFER;
 use crate::interrupts::mouse::MOUSE_STATE;
-use crate::syscalls::input::{EVENT_KEYBOARD, EVENT_MOUSE};
 
 /// USB HID device types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

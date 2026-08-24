@@ -93,11 +93,11 @@ impl InputRouter {
     ) -> u32 {
         // 1. Update cursor position.
         let prev_left = cursor.left_button();
-        let prev_right = cursor.right_button();
+        let _prev_right = cursor.right_button();
         cursor.apply_delta(event.mouse_dx, event.mouse_dy, event.mouse_buttons, fb_width, fb_height);
 
         let left_down = cursor.left_button() && !prev_left;
-        let left_up = !cursor.left_button() && prev_left;
+        let _left_up = !cursor.left_button() && prev_left;
 
         // 2. Handle dragging: if dragging, move the window.
         if self.drag.is_dragging() {
@@ -150,7 +150,7 @@ impl InputRouter {
     /// Process a keyboard event.
     fn process_keyboard(
         &mut self,
-        event: &InputEvent,
+        _event: &InputEvent,
         windows: &WindowList,
     ) -> u32 {
         // Route keyboard events to the focused window.

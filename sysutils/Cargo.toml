@@ -11,11 +11,3 @@ license = "MIT"
 [features]
 default = ["skeleton"]
 skeleton = []
-
-[profile.dev]
-panic = "abort"
-
-[profile.release]
-panic = "abort"
-lto = true
-opt-level = 3

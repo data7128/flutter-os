@@ -45,6 +45,8 @@
 
 #![no_std]
 #![allow(dead_code)]
+#![allow(static_mut_refs)]
+#![allow(mismatched_lifetime_syntaxes)]
 
 pub mod compositor;
 pub mod cursor;
@@ -56,7 +58,7 @@ pub mod window;
 use compositor::Compositor;
 use cursor::Cursor;
 use input_router::InputRouter;
-use window::{Color, WindowList};
+use window::WindowList;
 
 /// Global WM state.
 struct WmState {

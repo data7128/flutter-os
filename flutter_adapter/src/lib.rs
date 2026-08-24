@@ -47,6 +47,7 @@
 
 #![no_std]
 #![allow(dead_code)]
+#![allow(static_mut_refs)]
 
 pub mod embedder;
 pub mod framebuffer;
