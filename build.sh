@@ -2,8 +2,8 @@
 set -euo pipefail
 
 # ──────────────────────────────────────────────────────────
-#  AeroOS build script
-#  Builds the kernel and a bootable BIOS disk image.
+#  AeroOS Build Script
+#  Builds the kernel, user-mode crates, and bootable BIOS disk image.
 # ──────────────────────────────────────────────────────────
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -15,19 +15,30 @@ echo "════════════════════════�
 echo "  AeroOS Build"
 echo "═══════════════════════════════════════════════"
 
-# ── 1. Build kernel + BIOS disk image ──────────────────
+# ── 1. Check all user-mode crates compile ───────────────
 echo ""
-echo "[1/2] Building kernel and BIOS disk image..."
+echo "[1/4] Checking user-mode crates..."
+cargo check -p wm --release 2>&1 | tail -1
+cargo check -p flutter_shell --release 2>&1 | tail -1
+cargo check -p flutter_adapter --release 2>&1 | tail -1
+cargo check -p sysutils --release 2>&1 | tail -1
+echo "  ✓ All user-mode crates compile"
+
+# ── 2. Build kernel + BIOS disk image ────────────────────
+echo ""
+echo "[2/4] Building kernel and BIOS disk image..."
 cargo build -p aeros-os --release
 
-# ── 2. Copy the disk image to a stable path ────────────
+# ── 3. Copy the disk image to a stable path ──────────────
 echo ""
-echo "[2/2] Running image builder..."
+echo "[3/4] Running image builder..."
 IMAGE="target/aeros-os-bios.img"
 cargo run -p aeros-os --release --quiet
 
+# ── 4. Verify image ──────────────────────────────────────
+echo ""
+echo "[4/4] Verifying disk image..."
 if [ -f "$IMAGE" ]; then
-    echo ""
     echo "  ✓ Disk image: $IMAGE ($(du -h "$IMAGE" | cut -f1))"
     echo ""
     echo "═══════════════════════════════════════════════"
@@ -36,7 +47,10 @@ if [ -f "$IMAGE" ]; then
     echo "  Run in QEMU:"
     echo "    qemu-system-x86_64 \\"
     echo "      -drive format=raw,file=$IMAGE \\"
-    echo "      -serial stdio"
+    echo "      -serial stdio \\"
+    echo "      -device usb-uhci \\"
+    echo "      -usbdevice keyboard \\"
+    echo "      -usbdevice mouse"
     echo "═══════════════════════════════════════════════"
 else
     echo "  ✗ Disk image not found at $IMAGE"

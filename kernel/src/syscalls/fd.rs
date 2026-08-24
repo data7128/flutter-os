@@ -50,6 +50,7 @@ impl Default for FdEntry {
 ///
 /// ← FUTURE: when FAT32 is implemented, `open()` will allocate an
 /// `FdKind::File` entry here.
+#[derive(Clone, Copy)]
 pub struct FdTable {
     entries: [FdEntry; MAX_FDS],
 }
@@ -111,5 +112,12 @@ impl FdTable {
             .iter()
             .filter(|e| e.kind != FdKind::Free)
             .count()
+    }
+
+    /// Close all non-std FDs (called on process exit).
+    pub fn clear(&mut self) {
+        for i in 3..MAX_FDS {
+            self.entries[i] = FdEntry { kind: FdKind::Free };
+        }
     }
 }

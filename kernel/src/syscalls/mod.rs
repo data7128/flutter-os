@@ -75,6 +75,17 @@ pub enum SyscallNum {
     /// arg0 = pointer to `InputEvent` struct to fill.
     /// Returns 1 if event available, 0 if none.
     PollInput = 9,
+    /// `kill(pid, signum)` — send a signal to a process.
+    /// arg0 = pid, arg1 = signum.
+    Kill = 10,
+    /// `exit(status)` — terminate the calling process.
+    /// arg0 = exit code.
+    Exit = 11,
+    /// `exec(path, argv)` — load and run an ELF executable.
+    /// arg0 = path pointer, arg1 = argv pointer (unused in skeleton).
+    Exec = 12,
+    /// `getpid()` — return the current process ID.
+    Getpid = 13,
 }
 
 impl SyscallNum {
@@ -89,6 +100,10 @@ impl SyscallNum {
             7 => Some(Self::GetFramebufferInfo),
             8 => Some(Self::FbCommit),
             9 => Some(Self::PollInput),
+            10 => Some(Self::Kill),
+            11 => Some(Self::Exit),
+            12 => Some(Self::Exec),
+            13 => Some(Self::Getpid),
             _ => None,
         }
     }
@@ -113,10 +128,29 @@ pub fn init() {
     crate::serial::_print(format_args!("[syscalls] int 0x80 handler registered\n"));
 }
 
+/// EPERM error code (operation not permitted).
+const EPERM: i64 = -1;
+
+/// Check if the current process has permission for a resource.
+/// Returns `true` if access is granted, `false` if denied.
+///
+/// When Ring3 is implemented, this will be called before executing
+/// sensitive syscalls (fb_commit, poll_input, kill, exec, etc.).
+fn check_perm(resource: crate::perm::Resource) -> bool {
+    let pid = crate::process::PROCESS_TABLE.lock().current_pid;
+    crate::perm::check_permission(pid, resource)
+}
+
 /// Dispatch a syscall by number. Called from the interrupt handler
 /// after extracting arguments from registers.
 ///
 /// Returns `i64`: non-negative on success, negative errno on failure.
+///
+/// Permission checks are applied to sensitive syscalls:
+/// - `fb_commit` / `get_framebuffer_info` → Resource::Framebuffer
+/// - `poll_input` → Resource::InputEvents
+/// - `kill` → Resource::ProcessControl
+/// - `exec` → Resource::Exec
 ///
 /// ← FUTURE: this is the function that Ring3 user-mode code will
 /// invoke. Flutter Engine will call through this path.
@@ -130,6 +164,26 @@ pub fn dispatch(
     _arg4: u64,
     _arg5: u64,
 ) -> i64 {
+    // Pre-dispatch permission checks for sensitive syscalls.
+    // In Ring 0 mode (current_pid=0) all checks pass; in Ring 3
+    // user processes will be filtered by privilege level.
+    let perm_resource = match SyscallNum::from_u64(num) {
+        Some(SyscallNum::GetFramebufferInfo) => Some(crate::perm::Resource::Framebuffer),
+        Some(SyscallNum::FbCommit) => Some(crate::perm::Resource::Framebuffer),
+        Some(SyscallNum::PollInput) => Some(crate::perm::Resource::InputEvents),
+        Some(SyscallNum::Kill) => Some(crate::perm::Resource::ProcessControl),
+        Some(SyscallNum::Exec) => Some(crate::perm::Resource::Exec),
+        _ => None,
+    };
+    if let Some(res) = perm_resource {
+        if !check_perm(res) {
+            crate::serial::_print(format_args!(
+                "[syscall] EPERM: pid lacks {:?} permission\n", res
+            ));
+            return EPERM;
+        }
+    }
+
     unsafe {
         match SyscallNum::from_u64(num) {
             Some(SyscallNum::Open) => sys_open(arg0 as *const u8, arg1 as u32),
@@ -141,6 +195,10 @@ pub fn dispatch(
             Some(SyscallNum::GetFramebufferInfo) => sys_get_framebuffer_info(arg0),
             Some(SyscallNum::FbCommit) => sys_fb_commit(arg0, arg1, arg2, arg3, _arg4),
             Some(SyscallNum::PollInput) => sys_poll_input(arg0),
+            Some(SyscallNum::Kill) => sys_kill(arg0 as u32, arg1 as u8),
+            Some(SyscallNum::Exit) => sys_exit(arg0 as i32),
+            Some(SyscallNum::Exec) => sys_exec(arg0 as *const u8),
+            Some(SyscallNum::Getpid) => sys_getpid(),
             None => Errno::enosys.as_i64(),
         }
     }
@@ -428,6 +486,74 @@ unsafe fn sys_poll_input(event_ptr: u64) -> i64 {
     }
 
     ret
+}
+
+/// `kill(pid, signum)` → 0 on success, negative errno on failure.
+unsafe fn sys_kill(pid: u32, signum: u8) -> i64 {
+    crate::signal::sys_kill(pid, signum)
+}
+
+/// `exit(status)` → never returns (marks process as zombie).
+///
+/// Releases all process resources:
+/// - File descriptors (non-std FDs closed)
+/// - Pending signals cleared
+/// - Process state set to Zombie
+///
+/// [MANUAL] In Ring3, this performs an `iretq` back to the kernel
+/// scheduler. For now, it just marks the process and halts.
+unsafe fn sys_exit(status: i32) -> i64 {
+    let current = crate::process::PROCESS_TABLE.lock().current_pid;
+    crate::serial::_print(format_args!(
+        "[syscall] exit({}) from pid={}\n", status, current
+    ));
+
+    // Release resources and mark as zombie.
+    crate::process::PROCESS_TABLE.lock().mark_exit(current, status);
+
+    // [MANUAL] In Ring3: switch to next runnable process here.
+    // For now, halt — kernel has no scheduler yet.
+    crate::hlt_loop();
+}
+
+/// `exec(path)` → 0 on success, negative errno on failure.
+///
+/// Loads an ELF executable and prepares a new process.
+unsafe fn sys_exec(path: *const u8) -> i64 {
+    if path.is_null() {
+        return Errno::efault.as_i64();
+    }
+
+    // Read the null-terminated path.
+    let mut len = 0usize;
+    while *path.add(len) != 0 {
+        len += 1;
+        if len > 255 {
+            return Errno::einval.as_i64(); // Path too long.
+        }
+    }
+    let path_slice = core::slice::from_raw_parts(path, len);
+
+    // Security validation: path must start with '/'.
+    if path_slice.is_empty() || path_slice[0] != b'/' {
+        crate::serial::_print(format_args!("[exec] rejected: path must be absolute\n"));
+        return Errno::einval.as_i64();
+    }
+
+    // Security validation: reject path traversal (..).
+    let path_str = core::str::from_utf8(path_slice).unwrap_or("");
+    if path_str.contains("..") {
+        crate::serial::_print(format_args!("[exec] rejected: path traversal detected\n"));
+        return Errno::einval.as_i64();
+    }
+
+    // Delegate to the ELF loader.
+    crate::exec::sys_exec(path_slice, &[])
+}
+
+/// `getpid()` → current process ID.
+unsafe fn sys_getpid() -> i64 {
+    crate::process::PROCESS_TABLE.lock().current_pid as i64
 }
 
 

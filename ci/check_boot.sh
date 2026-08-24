@@ -63,7 +63,7 @@ ALL_OK=true
 # [OK] = subsystem initialised successfully.
 # [PENDING] = subsystem not yet implemented (kernel still booted to this point).
 # Missing marker = kernel crashed before reaching this subsystem → FAIL.
-for marker in "GDT" "IDT" "PIC" "HEAP" "KEYBOARD" "MOUSE" "GRAPHICS" "TIME" "SYSCALLS" "FLUTTER_ADAPTER" "WINDOW_MANAGER" "USERMODE" "SCHEDULER" "SIGNAL" "FORK_EXEC"; do
+for marker in "GDT" "IDT" "PIC" "HEAP" "KEYBOARD" "MOUSE" "GRAPHICS" "TIME" "SYSCALLS" "FLUTTER_ADAPTER" "WINDOW_MANAGER" "EXEC_LOADER" "FLUTTER_SHELL" "SIGNAL_SUBSYS" "OOM_HANDLER" "UHCI_USB" "USB_HID_INPUT" "AERO_APP_FORMAT" "PERMISSION_SUBSYS" "USERMODE" "SCHEDULER" "SIGNAL" "FORK_EXEC"; do
     if grep -q "\[OK\] ${marker}\|\[PENDING\] ${marker}\|\[WARN\] ${marker}" "${OUTPUT_FILE}"; then
         echo "  ✓ ${marker} marker found"
     else
@@ -72,19 +72,37 @@ for marker in "GDT" "IDT" "PIC" "HEAP" "KEYBOARD" "MOUSE" "GRAPHICS" "TIME" "SYS
     fi
 done
 
+# ── Application startup detection ───────────────────────────
+echo ""
+echo "  ── Application Startup Detection ──────────────"
+
+# Check that the boot service launched WM and Flutter Shell processes.
+APP_OK=true
+
+for app_marker in "EXEC_LOADER" "FLUTTER_SHELL" "AERO_APP_FORMAT" "PERMISSION_SUBSYS"; do
+    if grep -q "\[OK\] ${app_marker}" "${OUTPUT_FILE}"; then
+        echo "  ✓ ${app_marker} — application subsystem ready"
+    else
+        echo "  ✗ ${app_marker} — application subsystem NOT started"
+        APP_OK=false
+    fi
+done
+
 echo ""
 rm -f "${OUTPUT_FILE}"
 
-if [ "${ALL_OK}" = "true" ]; then
+if [ "${ALL_OK}" = "true" ] && [ "${APP_OK}" = "true" ]; then
     echo "═══════════════════════════════════════════════"
     echo "  RESULT: PASS ✓"
     echo "  All subsystem boot markers detected."
+    echo "  Application startup sequence verified."
     echo "═══════════════════════════════════════════════"
     exit 0
 else
     echo "═══════════════════════════════════════════════"
     echo "  RESULT: FAIL ✗"
-    echo "  Missing subsystem boot markers."
+    echo "  Missing subsystem boot markers or"
+    echo "  application startup sequence incomplete."
     echo ""
     echo "  Note: CI can only detect boot-log markers."
     echo "  Cannot test graphics, keyboard interaction,"

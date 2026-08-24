@@ -1,0 +1,21 @@
+[package]
+name = "sysutils"
+version = "0.1.0"
+edition = "2021"
+authors = ["flutter-os contributors"]
+description = "System debug utilities: ls, cat, ps, kill (Ring3, no_std)"
+license = "MIT"
+
+[dependencies]
+
+[features]
+default = ["skeleton"]
+skeleton = []
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = true
+opt-level = 3

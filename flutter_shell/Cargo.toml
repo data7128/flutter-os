@@ -1,0 +1,23 @@
+[package]
+name = "flutter_shell"
+version = "0.1.0"
+edition = "2021"
+authors = ["flutter-os contributors"]
+description = "Flutter system shell desktop (Ring3, no_std, software-rendered)"
+license = "MIT"
+
+[dependencies]
+# No external crates — pure bare-metal user-mode code.
+
+[features]
+default = ["skeleton"]
+# Skeleton mode: provides fallback rendering when syscalls return ENOSYS.
+skeleton = []
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = true
+opt-level = 3
