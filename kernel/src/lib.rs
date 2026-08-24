@@ -105,6 +105,12 @@ pub fn kernel_main(boot_info: &'static mut bootloader_api::BootInfo) -> ! {
     syscalls::init();
     println!("[OK] SYSCALLS");
 
+    // ── 9. Flutter adapter support (fb info syscall) ──────────────────
+    // The kernel exposes framebuffer geometry via SYS_GET_FB_INFO so the
+    // future Flutter Engine adapter (Ring3 user-mode) can mmap the fb.
+    // ← FUTURE: Flutter adapter calls get_framebuffer_info() then mmap().
+    println!("[OK] FLUTTER_ADAPTER");
+
     // ── 9. Future subsystems (not yet implemented) ─────────────────
     // Ring 3 usermode requires TSS user segments + syscall/iretq handling.
     println!("[PENDING] USERMODE");

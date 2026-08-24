@@ -64,6 +64,9 @@ pub enum SyscallNum {
     Mmap = 4,
     Nanosleep = 5,
     ClockGettime = 6,
+    /// Query framebuffer info (address, width, height, stride, bpp, format).
+    /// Returns a `FramebufferInfoUser` struct at the pointer in arg0.
+    GetFramebufferInfo = 7,
 }
 
 impl SyscallNum {
@@ -75,6 +78,7 @@ impl SyscallNum {
             4 => Some(Self::Mmap),
             5 => Some(Self::Nanosleep),
             6 => Some(Self::ClockGettime),
+            7 => Some(Self::GetFramebufferInfo),
             _ => None,
         }
     }
@@ -127,6 +131,7 @@ pub fn dispatch(
             Some(SyscallNum::Mmap) => sys_mmap(arg0, arg1, arg2 as u32),
             Some(SyscallNum::Nanosleep) => sys_nanosleep(arg0, arg1),
             Some(SyscallNum::ClockGettime) => sys_clock_gettime(arg0, arg1),
+            Some(SyscallNum::GetFramebufferInfo) => sys_get_framebuffer_info(arg0),
             None => Errno::enosys.as_i64(),
         }
     }
@@ -290,6 +295,41 @@ unsafe fn sys_clock_gettime(clk_id: u64, tp: u64) -> i64 {
     let tp = tp as *mut i64;
     *tp = secs as i64;
     *tp.add(1) = nanos as i64;
+    0
+}
+
+/// `get_framebuffer_info(info_ptr)` → 0 on success.
+///
+/// Writes a `FramebufferInfoUser` struct at `info_ptr` containing
+/// the framebuffer address, dimensions, stride, bpp, and pixel format.
+///
+/// This lets user-mode code (flutter_adapter) know how to mmap the
+/// framebuffer for rendering.
+///
+/// ← FUTURE: Flutter adapter calls this to obtain fb geometry before
+/// calling mmap to map the fb into user space.
+unsafe fn sys_get_framebuffer_info(info_ptr: u64) -> i64 {
+    if info_ptr == 0 {
+        return Errno::efault.as_i64();
+    }
+
+    let (fb_addr, fb_len, width, height, stride, bpp, format) = {
+        match crate::graphics::get_fb_state() {
+            Some(s) => s,
+            None => return Errno::enosys.as_i64(),
+        }
+    };
+
+    // Write FramebufferInfoUser struct: { u64 addr; u32 w; u32 h; u32 stride; u32 bpp; u32 fmt; }
+    let ptr = info_ptr as *mut u64;
+    *ptr = fb_addr as u64;
+    *ptr.add(1) = width as u64;
+    *ptr.add(2) = height as u64;
+    *ptr.add(3) = stride as u64;
+    *ptr.add(4) = bpp as u64;
+    *ptr.add(5) = format as u64;
+    *ptr.add(6) = fb_len as u64;
+
     0
 }
 

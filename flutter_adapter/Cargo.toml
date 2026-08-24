@@ -1,0 +1,27 @@
+[package]
+name = "flutter_adapter"
+version = "0.1.0"
+edition = "2021"
+authors = ["flutter-os contributors"]
+description = "Flutter Engine user-mode adaptation layer skeleton for AeroOS"
+license = "MIT"
+
+[dependencies]
+# No external crates — this is bare-metal user-mode code.
+# All Flutter types are re-defined locally to avoid depending on
+# the real flutter_engine crate (which doesn't exist for no_std).
+
+[features]
+# Skeleton mode: provides fallback values when syscalls return ENOSYS,
+# allowing the adapter to compile and be type-checked without a real
+# Ring3 kernel. Enabled by default during development.
+default = ["skeleton"]
+skeleton = []
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = true
+opt-level = 3

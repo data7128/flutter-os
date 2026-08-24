@@ -175,4 +175,29 @@ pub fn clear(color: Color) {
     fill_rect(0, 0, width(), height(), color);
 }
 
+/// Public accessor for syscall `get_framebuffer_info`.
+///
+/// Returns a tuple of (buffer_ptr, len, width, height, stride, bpp, format).
+/// `format`: 0=RGB, 1=BGR, 2=other.
+///
+/// ← FUTURE: Flutter adapter calls `SYS_GET_FB_INFO` which calls this.
+pub fn get_fb_state() -> Option<(*mut u8, usize, u32, u32, u32, u32, u32)> {
+    let state = GRAPHICS.lock();
+    let info = state.info?;
+    let format = match info.pixel_format {
+        PixelFormat::Rgb => 0,
+        PixelFormat::Bgr => 1,
+        _ => 2,
+    };
+    Some((
+        state.buffer,
+        state.len,
+        info.width as u32,
+        info.height as u32,
+        info.stride as u32,
+        info.bytes_per_pixel as u32,
+        format,
+    ))
+}
+
 
