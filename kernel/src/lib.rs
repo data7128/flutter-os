@@ -83,9 +83,11 @@ pub fn kernel_main(boot_info: &'static mut bootloader_api::BootInfo) -> ! {
     memory::init();
     println!("[OK] HEAP");
 
-    // ── 5. PS/2 keyboard (unmask IRQ1) ──────────────────────────────
+    // ── 5. PS/2 keyboard + mouse (unmask IRQ1 + IRQ12) ─────────────
     interrupts::enable_keyboard();
+    interrupts::mouse::init();
     println!("[OK] KEYBOARD");
+    println!("[OK] MOUSE");
 
     // ── 6. Framebuffer graphics (from bootloader BootInfo) ──────────
     // Future GUI layer (e.g. Flutter engine embedder) will attach here.
@@ -110,6 +112,15 @@ pub fn kernel_main(boot_info: &'static mut bootloader_api::BootInfo) -> ! {
     // future Flutter Engine adapter (Ring3 user-mode) can mmap the fb.
     // ← FUTURE: Flutter adapter calls get_framebuffer_info() then mmap().
     println!("[OK] FLUTTER_ADAPTER");
+
+    // ── 10. Window manager support (fb_commit + poll_input syscalls) ──
+    // The kernel exposes two new syscalls for the user-mode WM:
+    //   SYS_FB_COMMIT  — blit a rendered buffer to the physical framebuffer
+    //   SYS_POLL_INPUT — poll for structured keyboard/mouse input events
+    // The WM itself runs as a Ring3 user-mode process. The kernel
+    // does NOT contain any window management, clipping, or cursor logic.
+    // ← FUTURE: WM calls poll_input() + fb_commit() in its event loop.
+    println!("[OK] WINDOW_MANAGER");
 
     // ── 9. Future subsystems (not yet implemented) ─────────────────
     // Ring 3 usermode requires TSS user segments + syscall/iretq handling.

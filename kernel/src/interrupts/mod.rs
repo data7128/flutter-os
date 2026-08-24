@@ -9,6 +9,7 @@ use spin::Mutex;
 
 pub mod gdt;
 pub mod idt;
+pub mod mouse;
 
 /// Offset the master PIC to 0x20 so IRQs don't overlap CPU exceptions
 /// (which occupy 0x00..=0x1f).
@@ -26,6 +27,8 @@ pub static PICS: Mutex<ChainedPics> =
 pub enum InterruptIndex {
     Timer = PIC_1_OFFSET,
     Keyboard = PIC_1_OFFSET + 1,
+    /// IRQ12 — PS/2 mouse (secondary PIC, line 4).
+    Mouse = PIC_2_OFFSET + 4,
 }
 
 impl InterruptIndex {
@@ -89,10 +92,18 @@ pub fn init() {
     x86_64::instructions::interrupts::enable();
 }
 
-/// Unmask IRQ0 (timer) and IRQ1 (keyboard) on the master PIC. A bit set
-/// in the mask disables that interrupt.
-pub fn enable_keyboard() {
+/// Unmask IRQ0 (timer), IRQ1 (keyboard), and IRQ12 (mouse) on the PICs.
+/// A bit set in the mask disables that interrupt.
+/// IRQ2 on master must be unmasked to let the slave PIC deliver IRQ12.
+pub fn enable_input() {
     unsafe {
-        PICS.lock().write_masks(0b1111_1100, 0xff);
+        // Master: unmask IRQ0 (bit0), IRQ1 (bit1), IRQ2 (bit2 = cascade to slave)
+        // Slave:  unmask IRQ4 (bit4 = IRQ12 = mouse)
+        PICS.lock().write_masks(0b1111_1000, 0b1110_1111);
     }
+}
+
+/// Legacy: only keyboard. Kept for compatibility.
+pub fn enable_keyboard() {
+    enable_input();
 }

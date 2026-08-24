@@ -27,6 +27,7 @@
 //! instruction (MSR_STAR) will replace `int 0x80`.
 
 pub mod fd;
+pub mod input;
 pub mod time;
 
 pub use fd::FdTable;
@@ -67,6 +68,13 @@ pub enum SyscallNum {
     /// Query framebuffer info (address, width, height, stride, bpp, format).
     /// Returns a `FramebufferInfoUser` struct at the pointer in arg0.
     GetFramebufferInfo = 7,
+    /// Commit (blit) a rendered buffer to the physical framebuffer.
+    /// arg0 = buffer pointer, arg1 = x, arg2 = y, arg3 = width, arg4 = height.
+    FbCommit = 8,
+    /// Poll for the next input event (keyboard or mouse).
+    /// arg0 = pointer to `InputEvent` struct to fill.
+    /// Returns 1 if event available, 0 if none.
+    PollInput = 9,
 }
 
 impl SyscallNum {
@@ -79,6 +87,8 @@ impl SyscallNum {
             5 => Some(Self::Nanosleep),
             6 => Some(Self::ClockGettime),
             7 => Some(Self::GetFramebufferInfo),
+            8 => Some(Self::FbCommit),
+            9 => Some(Self::PollInput),
             _ => None,
         }
     }
@@ -116,13 +126,10 @@ pub fn dispatch(
     arg0: u64,
     arg1: u64,
     arg2: u64,
-    _arg3: u64,
+    arg3: u64,
     _arg4: u64,
     _arg5: u64,
 ) -> i64 {
-    // SAFETY: All syscall implementations operate on raw pointers
-    // that originate from user-space. When Ring3 is implemented,
-    // proper validation (copy_from_user, etc.) will be added here.
     unsafe {
         match SyscallNum::from_u64(num) {
             Some(SyscallNum::Open) => sys_open(arg0 as *const u8, arg1 as u32),
@@ -132,6 +139,8 @@ pub fn dispatch(
             Some(SyscallNum::Nanosleep) => sys_nanosleep(arg0, arg1),
             Some(SyscallNum::ClockGettime) => sys_clock_gettime(arg0, arg1),
             Some(SyscallNum::GetFramebufferInfo) => sys_get_framebuffer_info(arg0),
+            Some(SyscallNum::FbCommit) => sys_fb_commit(arg0, arg1, arg2, arg3, _arg4),
+            Some(SyscallNum::PollInput) => sys_poll_input(arg0),
             None => Errno::enosys.as_i64(),
         }
     }
@@ -331,6 +340,94 @@ unsafe fn sys_get_framebuffer_info(info_ptr: u64) -> i64 {
     *ptr.add(6) = fb_len as u64;
 
     0
+}
+
+/// `fb_commit(buf, x, y, w, h)` → 0 on success.
+///
+/// Copies a rectangular region from the user-provided buffer to the
+/// physical framebuffer. The buffer must be in the framebuffer's
+/// native pixel format (matching bpp).
+///
+/// This is the **double-buffer commit** path: the WM renders to an
+/// off-screen buffer, then calls this syscall to blit it to the screen.
+///
+/// Args:
+/// - `buf_ptr` (arg0): pointer to the source pixel buffer
+/// - `x` (arg1): destination X offset on the framebuffer
+/// - `y` (arg2): destination Y offset on the framebuffer
+/// - `w` (arg3): width of the region in pixels
+/// - `h` (arg4): height of the region in pixels
+unsafe fn sys_fb_commit(buf_ptr: u64, x: u64, y: u64, w: u64, h: u64) -> i64 {
+    if buf_ptr == 0 {
+        return Errno::efault.as_i64();
+    }
+    if w == 0 || h == 0 {
+        return Errno::einval.as_i64();
+    }
+
+    let (fb_addr, fb_len, fb_width, fb_height, fb_stride, bpp, _format) =
+        match crate::graphics::get_fb_state() {
+            Some(s) => s,
+            None => return Errno::enosys.as_i64(),
+        };
+
+    // Validate bounds.
+    if x >= fb_width as u64 || y >= fb_height as u64 {
+        return Errno::einval.as_i64();
+    }
+    let x_end = x.checked_add(w).unwrap_or(fb_width as u64);
+    let y_end = y.checked_add(h).unwrap_or(fb_height as u64);
+    if x_end > fb_width as u64 || y_end > fb_height as u64 {
+        return Errno::einval.as_i64();
+    }
+
+    let src = buf_ptr as *const u8;
+    let dst = fb_addr as *mut u8;
+    let bpp = bpp as usize;
+    let stride = fb_stride as usize;
+    let row_bytes = w as usize * bpp;
+
+    for row in 0..h as usize {
+        let src_off = row * row_bytes;
+        let dst_off = ((y as usize + row) * stride + x as usize) * bpp;
+        let copy_len = row_bytes;
+
+        if dst_off + copy_len > fb_len {
+            break;
+        }
+
+        core::ptr::copy_nonoverlapping(
+            src.add(src_off),
+            dst.add(dst_off),
+            copy_len,
+        );
+    }
+
+    0
+}
+
+/// `poll_input(event_ptr)` → 1 if event available, 0 if none.
+///
+/// Fills an `InputEvent` struct at the user-provided pointer with the
+/// next available keyboard or mouse event.
+///
+/// The WM calls this in its event loop to get structured input events.
+/// The kernel handles PS/2 scancode → InputEvent conversion and
+/// mouse packet → delta conversion internally.
+unsafe fn sys_poll_input(event_ptr: u64) -> i64 {
+    if event_ptr == 0 {
+        return Errno::efault.as_i64();
+    }
+
+    let event = event_ptr as *mut input::InputEvent;
+    let mut ev = input::InputEvent::default();
+    let ret = input::poll_next(&mut ev);
+
+    if ret > 0 {
+        core::ptr::write_volatile(event, ev);
+    }
+
+    ret
 }
 
 

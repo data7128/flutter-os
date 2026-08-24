@@ -10,6 +10,7 @@ use x86_64::instructions::port::Port;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame};
 
 use crate::interrupts::{InterruptIndex, PICS, SCANCODE_BUFFER};
+use crate::interrupts::mouse::MOUSE_STATE;
 use crate::println;
 
 lazy_static! {
@@ -23,6 +24,7 @@ lazy_static! {
         }
         idt[InterruptIndex::Timer.as_u8()].set_handler_fn(timer_interrupt_handler);
         idt[InterruptIndex::Keyboard.as_u8()].set_handler_fn(keyboard_interrupt_handler);
+        idt[InterruptIndex::Mouse.as_u8()].set_handler_fn(mouse_interrupt_handler);
         idt
     };
 }
@@ -81,5 +83,17 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
 
     unsafe {
         PICS.lock().notify_end_of_interrupt(InterruptIndex::Keyboard.as_u8());
+    }
+}
+
+extern "x86-interrupt" fn mouse_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    // Read one byte from the PS/2 data port (shared with keyboard).
+    // IRQ12 firing means this byte belongs to the mouse.
+    let mut port = Port::new(0x60);
+    let data: u8 = unsafe { port.read() };
+    MOUSE_STATE.lock().on_byte(data);
+
+    unsafe {
+        PICS.lock().notify_end_of_interrupt(InterruptIndex::Mouse.as_u8());
     }
 }
