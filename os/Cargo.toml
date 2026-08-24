@@ -1,0 +1,17 @@
+[package]
+name = "aeros-os"
+version = "0.1.0"
+edition = "2021"
+authors = ["flutter-os contributors"]
+description = "AeroOS bootable disk image builder (bootloader 0.11 artifact)"
+
+[dependencies]
+bootloader = "0.11"
+aeros-kernel = { path = "../kernel", artifact = "bin", target = "x86_64-unknown-none" }
+
+[build-dependencies]
+bootloader = "0.11"
+
+[[bin]]
+name = "aeros-os"
+path = "src/main.rs"
