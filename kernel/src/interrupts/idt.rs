@@ -32,6 +32,26 @@ pub fn init() {
     IDT.load();
 }
 
+/// Register the syscall handler at vector 0x80.
+///
+/// Called from `syscalls::init()` after the IDT is loaded.
+/// This is a skeleton: the int 0x80 gate is documented but not yet
+/// wired into the IDT, because Ring3 usermode hasn't been implemented
+/// yet (there's no code path that triggers `int 0x80`).
+///
+/// ← FUTURE: when Ring3 is implemented, this will properly set
+/// `idt[0x80]` as a user-accessible interrupt gate with DPL=3.
+pub fn set_syscall_handler() {
+    // TODO: when Ring3 is implemented:
+    //   unsafe {
+    //     IDT[0x80].set_handler_fn(syscall_handler)
+    //       .set_privilege_level(DestinationPrivilegeLevel::Ring3);
+    //   }
+    crate::serial::_print(format_args!(
+        "[idt] syscall handler at vector 0x80 registered (skeleton — Ring3 pending)\n"
+    ));
+}
+
 extern "x86-interrupt" fn breakpoint_handler(stack_frame: InterruptStackFrame) {
     println!("[int] BREAKPOINT\n{:#?}", stack_frame);
 }
@@ -44,6 +64,9 @@ extern "x86-interrupt" fn double_fault_handler(
 }
 
 extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    // Increment the kernel tick counter for the time subsystem.
+    crate::syscalls::time::on_timer_tick();
+
     // Acknowledge the timer so the PIC can deliver the next tick.
     unsafe {
         PICS.lock().notify_end_of_interrupt(InterruptIndex::Timer.as_u8());

@@ -22,6 +22,7 @@ pub mod mem;
 pub mod memory;
 pub mod serial;
 pub mod shell_host;
+pub mod syscalls;
 pub mod vga_buffer;
 
 use bootloader_api::config::{BootloaderConfig, Mapping};
@@ -95,11 +96,24 @@ pub fn kernel_main(boot_info: &'static mut bootloader_api::BootInfo) -> ! {
         println!("[WARN] GRAPHICS — no framebuffer from bootloader");
     }
 
-    // ── 7. Future subsystems (not yet implemented) ─────────────────
+    // ── 7. Time subsystem (PIT-programmed, tick counter for clock_gettime) ─
+    syscalls::time::init();
+    println!("[OK] TIME");
+
+    // ── 8. Syscall framework (int 0x80 dispatch: open/read/write/mmap/...) ─
+    // ← FUTURE: Flutter Engine as Ring3 user program will invoke these.
+    syscalls::init();
+    println!("[OK] SYSCALLS");
+
+    // ── 9. Future subsystems (not yet implemented) ─────────────────
     // Ring 3 usermode requires TSS user segments + syscall/iretq handling.
     println!("[PENDING] USERMODE");
     // Scheduler requires context switching (task structs, context save/restore).
     println!("[PENDING] SCHEDULER");
+    // Signals (kill, sigaction) require per-process signal mask + delivery.
+    println!("[PENDING] SIGNAL");
+    // fork/exec require process address space duplication + ELF loader.
+    println!("[PENDING] FORK_EXEC");
 
     println!("[boot] AeroOS ready — all subsystems online.\n");
 
