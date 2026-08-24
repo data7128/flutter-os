@@ -1,0 +1,43 @@
+name: Build & Test OS
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+env:
+  # Deny all compiler warnings — CI must be zero-warning.
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  build-and-test:
+    name: Build & QEMU Boot Test
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src, llvm-tools-preview
+          targets: x86_64-unknown-none
+
+      - name: Install QEMU
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-system-x86
+
+      - name: Build kernel (deny warnings)
+        run: cargo build -p aeros-kernel --target x86_64-unknown-none --verbose
+
+      - name: Build OS disk image
+        run: cargo build -p aeros-os --release --verbose
+
+      - name: Copy disk image to target/
+        run: cargo run -p aeros-os --release --quiet
+
+      - name: QEMU boot test
+        run: ./ci/check_boot.sh target/aeros-os-bios.img

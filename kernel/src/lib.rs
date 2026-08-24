@@ -1,8 +1,14 @@
 //! AeroOS kernel library — minimal x86_64 bare-metal kernel.
 //!
 //! Provides core kernel subsystems (VGA text, serial, GDT/IDT/PIC, heap
-//! allocation) and a `kernel_main` entry point that initialises everything
-//! and runs a keyboard-echo loop.
+//! allocation, framebuffer graphics) and a `kernel_main` entry point that
+//! initialises everything and runs a keyboard-echo loop on the framebuffer.
+//!
+//! ## Subsystem boot markers (for CI)
+//!
+//! After each subsystem initialises, a `[OK] <NAME>` marker is printed to
+//! the COM1 serial port. The CI script `ci/check_boot.sh` greps these
+//! markers to determine if the kernel booted successfully.
 
 #![no_std]
 #![feature(abi_x86_interrupt)]
@@ -10,10 +16,12 @@
 
 extern crate alloc;
 
+pub mod graphics;
 pub mod interrupts;
 pub mod mem;
 pub mod memory;
 pub mod serial;
+pub mod shell_host;
 pub mod vga_buffer;
 
 use bootloader_api::config::{BootloaderConfig, Mapping};
@@ -36,13 +44,16 @@ pub fn hlt_loop() -> ! {
 }
 
 /// Kernel entry point called by the bootloader in 64-bit long mode.
+///
+/// Initialisation order: serial → VGA → GDT → IDT → PIC → heap →
+/// keyboard → graphics → shell host. Each step prints a `[OK]` or
+/// `[PENDING]` marker that the CI boot-test script parses.
 pub fn kernel_main(boot_info: &'static mut bootloader_api::BootInfo) -> ! {
-    // 0. Serial first — it doesn't depend on any memory mapping.
+    // ── 0. Serial console (no memory mapping needed) ──────────────
     serial::init();
     serial::_print(format_args!("[boot] AeroOS kernel starting\n"));
 
-    // 0.5. VGA text buffer: needs the physical memory offset from the
-    // bootloader to translate 0xB8000 to its virtual address.
+    // ── 0.5. VGA text buffer (needs physical_memory_offset) ─────────
     let phys_offset = boot_info
         .physical_memory_offset
         .into_option()
@@ -52,34 +63,50 @@ pub fn kernel_main(boot_info: &'static mut bootloader_api::BootInfo) -> ! {
     // Now println! writes to both serial and VGA.
     println!("[boot] AeroOS kernel starting");
 
-    // 1. GDT → IDT → PIC
-    interrupts::init();
-    println!("[boot] interrupts online (GDT + IDT + 8259 PIC)");
+    // ── 1. GDT (code + data segments + TSS) ────────────────────────
+    interrupts::gdt::init();
+    println!("[OK] GDT");
 
-    // 2. Heap allocator
-    memory::init();
-    println!("[boot] heap allocator online (1 MiB)");
+    // ── 2. IDT (breakpoint, double fault, timer, keyboard) ─────────
+    interrupts::idt::init();
+    println!("[OK] IDT");
 
-    // 3. Enable keyboard IRQ
-    interrupts::enable_keyboard();
-    println!("[boot] PS/2 keyboard enabled");
-    println!("[boot] AeroOS ready — type to echo to screen.\n");
-
-    // 4. Main loop: halt until interrupt, then drain keyboard queue.
-    loop {
-        x86_64::instructions::hlt();
-        while let Some(scancode) = interrupts::SCANCODE_BUFFER.lock().pop() {
-            // Ignore key-release codes (bit 7 set) and E0/E1 prefixes.
-            if scancode >= 0x80 || scancode == 0xe0 || scancode == 0xe1 {
-                continue;
-            }
-            if let Some(ch) = scancode_to_ascii(scancode) {
-                print!("{}", ch as char);
-            } else {
-                println!("\n[key] scan=0x{:02x}", scancode);
-            }
-        }
+    // ── 3. 8259A PIC (remap + init + enable interrupts) ─────────────
+    unsafe {
+        interrupts::PICS.lock().initialize();
     }
+    x86_64::instructions::interrupts::enable();
+    println!("[OK] PIC");
+
+    // ── 4. Heap allocator (1 MiB static BSS array) ──────────────────
+    memory::init();
+    println!("[OK] HEAP");
+
+    // ── 5. PS/2 keyboard (unmask IRQ1) ──────────────────────────────
+    interrupts::enable_keyboard();
+    println!("[OK] KEYBOARD");
+
+    // ── 6. Framebuffer graphics (from bootloader BootInfo) ──────────
+    // Future GUI layer (e.g. Flutter engine embedder) will attach here.
+    if let Some(fb) = boot_info.framebuffer.take() {
+        graphics::init(fb);
+        println!("[OK] GRAPHICS");
+    } else {
+        println!("[WARN] GRAPHICS — no framebuffer from bootloader");
+    }
+
+    // ── 7. Future subsystems (not yet implemented) ─────────────────
+    // Ring 3 usermode requires TSS user segments + syscall/iretq handling.
+    println!("[PENDING] USERMODE");
+    // Scheduler requires context switching (task structs, context save/restore).
+    println!("[PENDING] SCHEDULER");
+
+    println!("[boot] AeroOS ready — all subsystems online.\n");
+
+    // ── 8. Launch framebuffer shell host (never returns) ────────────
+    // ← FUTURE: Flutter engine embedder would take over here, rendering
+    //   Dart UI onto the same framebuffer.
+    shell_host::launch();
 }
 
 /// Combine serial + VGA output so a single `println!` reaches both.
@@ -98,7 +125,7 @@ macro_rules! println {
 }
 
 /// Map a PS/2 Set-1 make code to lowercase ASCII (printable keys only).
-fn scancode_to_ascii(sc: u8) -> Option<u8> {
+pub fn scancode_to_ascii(sc: u8) -> Option<u8> {
     Some(match sc {
         0x02 => b'1', 0x03 => b'2', 0x04 => b'3', 0x05 => b'4', 0x06 => b'5',
         0x07 => b'6', 0x08 => b'7', 0x09 => b'8', 0x0a => b'9', 0x0b => b'0',
