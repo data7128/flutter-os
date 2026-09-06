@@ -26,11 +26,14 @@ pub mod memory;
 pub mod oom;
 pub mod perm;
 pub mod process;
+pub mod scheduler;
 pub mod serial;
 pub mod shell_host;
 pub mod signal;
+pub mod syscall_trampoline;
 pub mod syscalls;
 pub mod usb;
+pub mod userproc;
 pub mod vga_buffer;
 
 use bootloader_api::config::{BootloaderConfig, Mapping};
@@ -90,6 +93,17 @@ pub fn kernel_main(boot_info: &'static mut bootloader_api::BootInfo) -> ! {
     // ── 4. Heap allocator (1 MiB static BSS array) ──────────────────
     memory::init();
     println!("[OK] HEAP");
+
+    // ── 4.5. Memory subsystem: physical frame allocator + page tables ─
+    // Initialises the frame allocator from the bootloader memory map
+    // and sets up the kernel OffsetPageTable. Required for user-mode
+    // address spaces and Ring3 isolation.
+    unsafe {
+        memory::init_memory_subsystem(
+            &mut boot_info.memory_regions,
+            phys_offset,
+        );
+    }
 
     // ── 5. PS/2 keyboard + mouse (unmask IRQ1 + IRQ12) ─────────────
     interrupts::enable_keyboard();
@@ -185,10 +199,93 @@ pub fn kernel_main(boot_info: &'static mut bootloader_api::BootInfo) -> ! {
 
     println!("[boot] AeroOS ready — all subsystems online.\n");
 
-    // ── 8. Launch framebuffer shell host (never returns) ────────────
-    // ← FUTURE: Flutter engine embedder would take over here, rendering
-    //   Dart UI onto the same framebuffer.
+    // ── 19. Ring3 user-mode test ───────────────────────────────────
+    // Maps a minimal user program + user stack into the kernel page
+    // table (with USER_ACCESSIBLE) and iretqs into Ring3. The user
+    // program calls write(1, "Hello from Ring3!\n", 19) via int 0x80,
+    // then exit(0). This validates: GDT user segments, TSS RSP0,
+    // IDT syscall gate (DPL=3), syscall trampoline, and iretq.
+    println!("[boot] launching Ring3 user-mode test...");
+    launch_ring3_test();
+
+    // ── fallback: shell host (never returns) ────────────────────────
     shell_host::launch();
+}
+
+/// Minimal Ring3 user-mode test program (position-independent x86_64).
+///
+/// ```asm
+///   mov rax, 3          ; syscall Write
+///   mov rdi, 1          ; fd = stdout
+///   lea rsi, [rip+25]   ; msg = "Hello from Ring3!\n"
+///   mov rdx, 19         ; len
+///   int 0x80
+///   mov rax, 11         ; syscall Exit
+///   mov rdi, 0          ; status = 0
+///   int 0x80
+///   msg: db "Hello from Ring3!", 0xA
+/// ```
+const RING3_TEST_CODE: &[u8] = &[
+    0x48, 0xC7, 0xC0, 0x03, 0x00, 0x00, 0x00, // mov rax, 3
+    0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00, // mov rdi, 1
+    0x48, 0x8D, 0x35, 0x19, 0x00, 0x00, 0x00, // lea rsi, [rip+25]
+    0x48, 0xC7, 0xC2, 0x13, 0x00, 0x00, 0x00, // mov rdx, 19
+    0xCD, 0x80, // int 0x80
+    0x48, 0xC7, 0xC0, 0x0B, 0x00, 0x00, 0x00, // mov rax, 11
+    0x48, 0xC7, 0xC7, 0x00, 0x00, 0x00, 0x00, // mov rdi, 0
+    0xCD, 0x80, // int 0x80
+    // msg: "Hello from Ring3!\n" (19 bytes)
+    b'H', b'e', b'l', b'l', b'o', b' ', b'f', b'r', b'o', b'm',
+    b' ', b'R', b'i', b'n', b'g', b'3', b'!', b'\n',
+];
+
+/// Launch the Ring3 user-mode test.
+///
+/// Maps the test code and a user stack into the kernel page table with
+/// USER_ACCESSIBLE, then `iretq`s into Ring3.
+fn launch_ring3_test() -> ! {
+    use x86_64::structures::paging::{Page, PageTableFlags, Size4KiB};
+    use x86_64::VirtAddr;
+
+    let user_flags = PageTableFlags::PRESENT
+        | PageTableFlags::WRITABLE
+        | PageTableFlags::USER_ACCESSIBLE;
+
+    // Map code page at 0x400000.
+    let code_page = Page::<Size4KiB>::containing_address(VirtAddr::new(0x400000));
+    let code_frame = match crate::memory::page_table::map_page_alloc(code_page, user_flags) {
+        Ok(f) => f,
+        Err(e) => {
+            println!("[ring3-test] failed to map code page: {}", e);
+            crate::hlt_loop();
+        }
+    };
+
+    // Copy test code into the code page (through physical-offset mapping).
+    let phys_offset = *crate::memory::page_table::PHYSICAL_OFFSET.lock();
+    let code_virt = VirtAddr::new(phys_offset + code_frame.start_address().as_u64());
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            RING3_TEST_CODE.as_ptr(),
+            code_virt.as_mut_ptr::<u8>(),
+            RING3_TEST_CODE.len(),
+        );
+    }
+
+    // Map user stack at 0x7000_0000 (one page, stack grows down).
+    let stack_page = Page::<Size4KiB>::containing_address(VirtAddr::new(0x7000_0000 - 4096));
+    if let Err(e) = crate::memory::page_table::map_page_alloc(stack_page, user_flags) {
+        println!("[ring3-test] failed to map stack page: {}", e);
+        crate::hlt_loop();
+    }
+    let user_stack_top = 0x7000_0000u64;
+
+    println!("[ring3-test] code at 0x400000, stack at 0x70000000, entering Ring3...");
+
+    // Enter Ring3. This never returns.
+    unsafe {
+        crate::syscall_trampoline::enter_usermode(0x400000, user_stack_top);
+    }
 }
 
 /// Combine serial + VGA output so a single `println!` reaches both.
