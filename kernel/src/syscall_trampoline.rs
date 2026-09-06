@@ -139,8 +139,6 @@ pub extern "C" fn syscall_dispatch(ctx: &mut InterruptContext) {
 /// - The GDT must have user code/data segments loaded (see `gdt::init`).
 /// - Interrupts must be enabled in RFLAGS (we set IF below).
 pub unsafe fn enter_usermode(entry: u64, user_stack_top: u64) -> ! {
-    use x86_64::instructions::segmentation::Segment;
-
     let user_code_sel = crate::interrupts::gdt::user_code_selector();
     let user_data_sel = crate::interrupts::gdt::user_data_selector();
 

@@ -207,9 +207,9 @@ pub fn kernel_main(boot_info: &'static mut bootloader_api::BootInfo) -> ! {
     // IDT syscall gate (DPL=3), syscall trampoline, and iretq.
     println!("[boot] launching Ring3 user-mode test...");
     launch_ring3_test();
-
-    // ── fallback: shell host (never returns) ────────────────────────
-    shell_host::launch();
+    // NOTE: launch_ring3_test is noreturn (iretq into Ring3), so no
+    // code after this point is reachable. The shell_host fallback is
+    // intentionally omitted — if Ring3 entry fails, the CPU triple-faults.
 }
 
 /// Minimal Ring3 user-mode test program (position-independent x86_64).

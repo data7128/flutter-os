@@ -121,7 +121,7 @@ impl ProcessKernelStack {
     pub fn setup_initial_context(&mut self, entry_point: u64) {
         let top = self.stack_top();
         // We push 7 values (entry + 6 callee-saved regs) = 56 bytes.
-        let mut rsp = top - 56;
+        let rsp = top - 56;
 
         unsafe {
             let ptr = rsp as *mut u64;
@@ -307,16 +307,7 @@ unsafe fn set_tss_rsp0(rsp0: u64) {
     };
 
     if !tss_ptr.is_null() {
-        // privilege_stack_table[0] is at offset 4 in the TSS (after
-        // the reserved u32 at offset 0). Each entry is a u64.
-        // TSS layout: [reserved: u32][privilege_stack_table: [u64; 3]]...
-        // So RSP0 is at offset 4.
-        let rsp0_ptr = tss_ptr as *mut u64;
-        // offset 4 bytes → index 1 in u64 array? No:
-        // offset 0: reserved (u32, 4 bytes)
-        // offset 4: RSP0 (u64, 8 bytes)
-        // In u64 array: index 0 starts at offset 0 (covers reserved+half of RSP0)
-        // This is messy. Let's use byte offsets.
+        // RSP0 is at offset 4 in the TSS (after the reserved u32 at offset 0).
         let rsp0_byte_ptr = (tss_ptr as *mut u8).add(4) as *mut u64;
         *rsp0_byte_ptr = rsp0;
     }

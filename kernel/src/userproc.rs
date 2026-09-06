@@ -13,7 +13,6 @@
 use x86_64::structures::paging::{Page, PageTableFlags, Size4KiB};
 use x86_64::VirtAddr;
 
-use crate::memory::frame_allocator;
 use crate::memory::page_table::AddressSpace;
 use crate::process::{ProcessState, PROCESS_TABLE};
 use crate::scheduler;
@@ -86,15 +85,15 @@ pub fn spawn_user_process(elf_data: &[u8], name: &[u8]) -> Result<u32, &'static 
 
     // The trampoline is the first function executed when the process is
     // scheduled. It runs in Ring0 and performs the iretq to Ring3.
-    scheduler::init_process_stack(slot, user_trampoline as u64);
+    scheduler::init_process_stack(slot, user_trampoline as *const () as u64);
 
     // Store the address space pointer in the process for later switching.
     // For now, we leak it (it lives for the process lifetime).
     // In a full implementation, Process would own the AddressSpace.
     let addr_space_box = alloc::boxed::Box::new(addr_space);
-    let addr_space_ptr = alloc::boxed::Box::into_raw(addr_space_box);
-    // Store in process (we use a reserved field for now).
-    // TODO: add address_space field to Process struct.
+    // The address space lives for the process lifetime; we leak it here.
+    // TODO: add address_space field to Process struct and clean up on exit.
+    core::mem::forget(addr_space_box);
 
     crate::serial::_print(format_args!(
         "[spawn] pid={} ready, entry={:#x}, stack={:#x}\n",

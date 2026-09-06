@@ -22,7 +22,6 @@ const MAX_FRAMES: usize = 32768;
 pub struct BootInfoFrameAllocator {
     free_stack: [u64; MAX_FRAMES],
     top: usize,
-    next_unused_frame: u64,
 }
 
 impl BootInfoFrameAllocator {
@@ -31,7 +30,6 @@ impl BootInfoFrameAllocator {
         Self {
             free_stack: [0; MAX_FRAMES],
             top: 0,
-            next_unused_frame: 0,
         }
     }
 

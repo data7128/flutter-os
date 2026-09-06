@@ -12,7 +12,6 @@ use x86_64::structures::paging::{
 };
 use x86_64::{PhysAddr, VirtAddr};
 
-use crate::memory::frame_allocator;
 use spin::Mutex;
 
 /// The kernel's active page table, initialised once at boot.
@@ -65,7 +64,7 @@ pub fn map_to(
 ) -> Result<(), &'static str> {
     let mut pt_guard = KERNEL_PAGE_TABLE.lock();
     let pt = pt_guard.as_mut().ok_or("page table not initialised")?;
-    let mut alloc = frame_allocator::FRAME_ALLOCATOR.lock();
+    let mut alloc = crate::memory::frame_allocator::FRAME_ALLOCATOR.lock();
     unsafe {
         pt.map_to(page, frame, flags, &mut *alloc)
             .map_err(|_| "map_to failed")?
@@ -79,7 +78,7 @@ pub fn map_page_alloc(
     page: Page<Size4KiB>,
     flags: PageTableFlags,
 ) -> Result<PhysFrame<Size4KiB>, &'static str> {
-    let frame = frame_allocator::alloc_frame().ok_or("out of physical frames")?;
+    let frame = crate::memory::frame_allocator::alloc_frame().ok_or("out of physical frames")?;
     map_to(page, frame, flags)?;
     Ok(frame)
 }
@@ -115,7 +114,7 @@ impl AddressSpace {
     /// higher-half entries (entries 256..512) from the kernel PML4 so
     /// that kernel memory is accessible during syscalls / interrupts.
     pub fn new_user() -> Result<Self, &'static str> {
-        let pml4_frame = frame_allocator::alloc_frame().ok_or("out of frames for PML4")?;
+        let pml4_frame = crate::memory::frame_allocator::alloc_frame().ok_or("out of frames for PML4")?;
 
         let phys_offset = *PHYSICAL_OFFSET.lock();
         let pml4_virt = VirtAddr::new(phys_offset + pml4_frame.start_address().as_u64());
@@ -166,7 +165,7 @@ impl AddressSpace {
         flags: PageTableFlags,
     ) -> Result<(), &'static str> {
         let phys_offset = *PHYSICAL_OFFSET.lock();
-        let mut alloc = frame_allocator::FRAME_ALLOCATOR.lock();
+        let mut alloc = crate::memory::frame_allocator::FRAME_ALLOCATOR.lock();
 
         // We build a temporary OffsetPageTable pointing at the user PML4.
         // The user PML4 is accessible at phys_offset + pml4_phys.
@@ -191,7 +190,7 @@ impl AddressSpace {
         page: Page<Size4KiB>,
         flags: PageTableFlags,
     ) -> Result<PhysFrame<Size4KiB>, &'static str> {
-        let frame = frame_allocator::alloc_frame().ok_or("out of physical frames")?;
+        let frame = crate::memory::frame_allocator::alloc_frame().ok_or("out of physical frames")?;
         self.map_user_page(page, frame, flags)?;
         Ok(frame)
     }

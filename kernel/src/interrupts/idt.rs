@@ -48,7 +48,7 @@ lazy_static! {
         // gets the right offset. The CPU doesn't care about the Rust
         // ABI — it just jumps to the offset.
         let syscall_handler: extern "x86-interrupt" fn(InterruptStackFrame) =
-            unsafe { core::mem::transmute(syscall_trampoline as usize) };
+            unsafe { core::mem::transmute(syscall_trampoline as *const () as usize) };
         idt[0x80]
             .set_handler_fn(syscall_handler)
             .set_privilege_level(PrivilegeLevel::Ring3);
