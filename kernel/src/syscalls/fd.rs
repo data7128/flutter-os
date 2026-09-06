@@ -21,8 +21,10 @@ pub const STDERR_FD: usize = 2;
 pub enum FdKind {
     /// Reserved standard stream (stdin/stdout/stderr).
     Stream,
-    /// FAT32 file on ATA disk (not yet implemented).
+    /// FAT32 file on ATA disk (legacy, not yet implemented).
     File { sector: u64, offset: u64, size: u64 },
+    /// VFS-backed file (tmpfs / future FAT32 / devfs).
+    VfsFile { mount_idx: usize, inode_id: u64, offset: u64 },
     /// Framebuffer device (/dev/fb0 equivalent).
     Framebuffer,
     /// Free / unused slot.
@@ -118,6 +120,15 @@ impl FdTable {
     pub fn clear(&mut self) {
         for i in 3..MAX_FDS {
             self.entries[i] = FdEntry { kind: FdKind::Free };
+        }
+    }
+
+    /// Update the file offset for a VFS-backed FD.
+    pub fn update_vfs_offset(&mut self, fd: usize, new_offset: u64) {
+        if fd < MAX_FDS {
+            if let FdKind::VfsFile { offset, .. } = &mut self.entries[fd].kind {
+                *offset = new_offset;
+            }
         }
     }
 }

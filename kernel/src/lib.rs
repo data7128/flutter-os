@@ -19,6 +19,7 @@ extern crate alloc;
 pub mod aero_format;
 pub mod boot_service;
 pub mod exec;
+pub mod fs;
 pub mod graphics;
 pub mod interrupts;
 pub mod mem;
@@ -104,6 +105,14 @@ pub fn kernel_main(boot_info: &'static mut bootloader_api::BootInfo) -> ! {
             phys_offset,
         );
     }
+
+    // ── 4.6. VFS + tmpfs root filesystem + initramfs ────────────────
+    // Mounts a tmpfs as "/" and populates it with embedded initramfs
+    // files (e.g. /bin/hello — a minimal Ring3 ELF user program).
+    fs::init();
+    fs::tmpfs::init();
+    fs::initramfs::init();
+    println!("[OK] VFS_TMPFS_INITRAMFS");
 
     // ── 5. PS/2 keyboard + mouse (unmask IRQ1 + IRQ12) ─────────────
     interrupts::enable_keyboard();
@@ -199,17 +208,31 @@ pub fn kernel_main(boot_info: &'static mut bootloader_api::BootInfo) -> ! {
 
     println!("[boot] AeroOS ready — all subsystems online.\n");
 
-    // ── 19. Ring3 user-mode test ───────────────────────────────────
-    // Maps a minimal user program + user stack into the kernel page
-    // table (with USER_ACCESSIBLE) and iretqs into Ring3. The user
-    // program calls write(1, "Hello from Ring3!\n", 19) via int 0x80,
-    // then exit(0). This validates: GDT user segments, TSS RSP0,
-    // IDT syscall gate (DPL=3), syscall trampoline, and iretq.
-    println!("[boot] launching Ring3 user-mode test...");
-    launch_ring3_test();
-    // NOTE: launch_ring3_test is noreturn (iretq into Ring3), so no
-    // code after this point is reachable. The shell_host fallback is
-    // intentionally omitted — if Ring3 entry fails, the CPU triple-faults.
+    // ── 19. Launch user process from VFS (/bin/hello) ────────────────
+    // Reads the embedded ELF from the initramfs tmpfs, spawns a Ring3
+    // user process, and starts the preemptive scheduler. The user program
+    // calls write(1, "Hello from /bin/hello!\n", 22) via int 0x80,
+    // then exit(0). This validates the full pipeline: VFS → ELF loader →
+    // user address space → scheduler → Ring3 → syscall → write.
+    println!("[boot] spawning /bin/hello from VFS...");
+    match userproc::spawn_user_process_from_path("/bin/hello") {
+        Ok(pid) => {
+            println!("[boot] /bin/hello spawned as pid={}", pid);
+            scheduler::start_scheduler();
+            println!("[boot] scheduler started — entering idle loop");
+            // Enable interrupts and halt forever; the scheduler will
+            // context-switch to the user process on the next timer tick.
+            x86_64::instructions::interrupts::enable();
+            loop {
+                x86_64::instructions::hlt();
+            }
+        }
+        Err(e) => {
+            println!("[boot] FAILED to spawn /bin/hello: {}", e);
+            println!("[boot] falling back to inline Ring3 test...");
+            launch_ring3_test();
+        }
+    }
 }
 
 /// Minimal Ring3 user-mode test program (position-independent x86_64).

@@ -311,3 +311,19 @@ extern "C" fn user_trampoline() -> ! {
         crate::syscall_trampoline::enter_usermode(entry, user_rsp);
     }
 }
+
+/// Spawn a user process from an ELF file at a VFS path.
+///
+/// Reads the entire ELF from the filesystem, then delegates to
+/// `spawn_user_process`. This is the implementation behind the `execve`
+/// syscall and the kernel's own test launches.
+pub fn spawn_user_process_from_path(path: &str) -> Result<u64, &'static str> {
+    let elf_data = crate::fs::VFS.lock().read_all(path)?;
+    if elf_data.is_empty() {
+        return Err("ELF file is empty");
+    }
+    // Use the file name (last component) as the process name.
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let pid = spawn_user_process(&elf_data, name.as_bytes())?;
+    Ok(pid as u64)
+}

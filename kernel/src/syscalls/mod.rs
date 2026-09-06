@@ -86,6 +86,8 @@ pub enum SyscallNum {
     Exec = 12,
     /// `getpid()` — return the current process ID.
     Getpid = 13,
+    /// `close(fd)` — close a file descriptor.
+    Close = 14,
 }
 
 impl SyscallNum {
@@ -104,6 +106,7 @@ impl SyscallNum {
             11 => Some(Self::Exit),
             12 => Some(Self::Exec),
             13 => Some(Self::Getpid),
+            14 => Some(Self::Close),
             _ => None,
         }
     }
@@ -199,6 +202,7 @@ pub fn dispatch(
             Some(SyscallNum::Exit) => sys_exit(arg0 as i32),
             Some(SyscallNum::Exec) => sys_exec(arg0 as *const u8),
             Some(SyscallNum::Getpid) => sys_getpid(),
+            Some(SyscallNum::Close) => sys_close(arg0 as i32),
             None => Errno::enosys.as_i64(),
         }
     }
@@ -208,26 +212,44 @@ pub fn dispatch(
 
 /// `open(path, flags)` → fd number (≥0) or negative errno.
 ///
-/// **Skeleton**: requires FAT32/ATA driver to be functional.
-/// Currently returns `ENOSYS`.
-///
-/// ← FUTURE: when FAT32 is implemented, this will look up the file
-/// on the ATA disk and allocate an FD entry.
-unsafe fn sys_open(path: *const u8, _flags: u32) -> i64 {
-    // TODO: resolve path through FAT32 filesystem.
-    // TODO: allocate FD entry.
-    //
-    // SKELETON: log the path for debugging, return ENOSYS.
+/// Opens a file through the VFS (currently tmpfs-backed). Supports
+/// O_CREAT (bit 0x40) to create a new file if it doesn't exist.
+unsafe fn sys_open(path: *const u8, flags: u32) -> i64 {
     if path.is_null() {
         return Errno::efault.as_i64();
     }
-    crate::serial::_print(format_args!(
-        "[syscall] open(\"{}\") — ENOSYS (no FAT32 driver yet)\n",
-        unsafe { core::ffi::CStr::from_ptr(path as *const core::ffi::c_char) }
-            .to_str()
-            .unwrap_or("<invalid>")
-    ));
-    Errno::enosys.as_i64()
+    // Read null-terminated path.
+    let mut len = 0usize;
+    while *path.add(len) != 0 {
+        len += 1;
+        if len > 255 { return Errno::einval.as_i64(); }
+    }
+    let path_slice = core::slice::from_raw_parts(path, len);
+    let path_str = match core::str::from_utf8(path_slice) {
+        Ok(s) => s,
+        Err(_) => return Errno::einval.as_i64(),
+    };
+
+    let create = (flags & 0x40) != 0; // O_CREAT
+    let vfs = crate::fs::VFS.lock();
+    let file = match vfs.open(path_str, create) {
+        Ok(f) => f,
+        Err(e) => {
+            crate::serial::_print(format_args!("[syscall] open(\"{}\") failed: {}\n", path_str, e));
+            return Errno::enoent.as_i64();
+        }
+    };
+
+    let mut table = FD_TABLE.lock();
+    let fd = table.alloc(crate::syscalls::fd::FdKind::VfsFile {
+        mount_idx: file.mount_idx,
+        inode_id: file.inode_id,
+        offset: 0,
+    });
+    match fd {
+        Some(f) => f as i64,
+        None => Errno::enomem.as_i64(),
+    }
 }
 
 /// `read(fd, buf, count)` → bytes_read (≥0) or negative errno.
@@ -256,12 +278,28 @@ unsafe fn sys_read(fd: i32, buf: *mut u8, count: u64) -> i64 {
         }
         _ => {
             // Check FD table for file-backed descriptors
-            let table = FD_TABLE.lock();
-            if table.get(fd as usize).is_some() {
-                // TODO: read from FAT32 file via ATA driver
-                Errno::enosys.as_i64()
-            } else {
-                Errno::ebadf.as_i64()
+            let mut table = FD_TABLE.lock();
+            match table.get(fd as usize) {
+                Some(entry) => {
+                    if let crate::syscalls::fd::FdKind::VfsFile { mount_idx, inode_id, offset } = entry.kind {
+                        // Read from VFS file.
+                        let vfs = crate::fs::VFS.lock();
+                        let mut vfs_file = crate::fs::VfsFile {
+                            inode_id, mount_idx, offset, file_type: crate::fs::FileType::Regular,
+                        };
+                        let n = vfs.read(&mut vfs_file, core::slice::from_raw_parts_mut(buf, count as usize));
+                        // Update offset in FD table.
+                        table.update_vfs_offset(fd as usize, vfs_file.offset);
+                        match n {
+                            Ok(bytes) => bytes as i64,
+                            Err(_) => Errno::einval.as_i64(),
+                        }
+                    } else {
+                        // Legacy File kind — not yet implemented.
+                        Errno::enosys.as_i64()
+                    }
+                }
+                None => Errno::ebadf.as_i64(),
             }
         }
     }
@@ -300,7 +338,29 @@ unsafe fn sys_write(fd: i32, buf: *const u8, count: u64) -> i64 {
             ));
             count as i64
         }
-        _ => Errno::ebadf.as_i64(),
+        _ => {
+            // VFS file write.
+            let mut table = FD_TABLE.lock();
+            match table.get(fd as usize) {
+                Some(entry) => {
+                    if let crate::syscalls::fd::FdKind::VfsFile { mount_idx, inode_id, offset } = entry.kind {
+                        let vfs = crate::fs::VFS.lock();
+                        let mut vfs_file = crate::fs::VfsFile {
+                            inode_id, mount_idx, offset, file_type: crate::fs::FileType::Regular,
+                        };
+                        let n = vfs.write(&mut vfs_file, slice);
+                        table.update_vfs_offset(fd as usize, vfs_file.offset);
+                        match n {
+                            Ok(bytes) => bytes as i64,
+                            Err(_) => Errno::einval.as_i64(),
+                        }
+                    } else {
+                        Errno::ebadf.as_i64()
+                    }
+                }
+                None => Errno::ebadf.as_i64(),
+            }
+        }
     }
 }
 
@@ -547,13 +607,36 @@ unsafe fn sys_exec(path: *const u8) -> i64 {
         return Errno::einval.as_i64();
     }
 
-    // Delegate to the ELF loader.
-    crate::exec::sys_exec(path_slice, &[])
+    // Delegate to the user process loader: read ELF from VFS and spawn.
+    match crate::userproc::spawn_user_process_from_path(path_str) {
+        Ok(pid) => {
+            crate::serial::_print(format_args!("[exec] spawned pid={} from \"{}\"\n", pid, path_str));
+            pid as i64
+        }
+        Err(e) => {
+            crate::serial::_print(format_args!("[exec] failed to load \"{}\": {}\n", path_str, e));
+            Errno::enoent.as_i64()
+        }
+    }
 }
 
 /// `getpid()` → current process ID.
 unsafe fn sys_getpid() -> i64 {
     crate::process::PROCESS_TABLE.lock().current_pid as i64
+}
+
+/// `close(fd)` → 0 on success, negative errno on failure.
+unsafe fn sys_close(fd: i32) -> i64 {
+    if fd < 3 {
+        // Don't allow closing stdin/stdout/stderr.
+        return Errno::ebadf.as_i64();
+    }
+    let mut table = FD_TABLE.lock();
+    if table.close(fd as usize) {
+        0
+    } else {
+        Errno::ebadf.as_i64()
+    }
 }
 
 
