@@ -17,6 +17,7 @@
 extern crate alloc;
 
 pub mod aero_format;
+pub mod ata;
 pub mod boot_service;
 pub mod exec;
 pub mod fs;
@@ -113,6 +114,16 @@ pub fn kernel_main(boot_info: &'static mut bootloader_api::BootInfo) -> ! {
     fs::tmpfs::init();
     fs::initramfs::init();
     println!("[OK] VFS_TMPFS_INITRAMFS");
+
+    // ── 4.7. ATA disk driver + FAT32 + devfs ────────────────────────
+    // Probes the primary IDE master, then (if a FAT32 partition exists)
+    // mounts it at /disk. devfs provides /dev/{hda,kbd,serial,framebuffer}.
+    ata::init();
+    fs::fat32::init();
+    fs::devfs::init();
+    println!("[OK] ATA_DISK");
+    println!("[OK] FAT32");
+    println!("[OK] DEVFS");
 
     // ── 5. PS/2 keyboard + mouse (unmask IRQ1 + IRQ12) ─────────────
     interrupts::enable_keyboard();
@@ -214,24 +225,51 @@ pub fn kernel_main(boot_info: &'static mut bootloader_api::BootInfo) -> ! {
     // calls write(1, "Hello from /bin/hello!\n", 22) via int 0x80,
     // then exit(0). This validates the full pipeline: VFS → ELF loader →
     // user address space → scheduler → Ring3 → syscall → write.
-    println!("[boot] spawning /bin/hello from VFS...");
-    match userproc::spawn_user_process_from_path("/bin/hello") {
-        Ok(pid) => {
-            println!("[boot] /bin/hello spawned as pid={}", pid);
-            scheduler::start_scheduler();
-            println!("[boot] scheduler started — entering idle loop");
-            // Enable interrupts and halt forever; the scheduler will
-            // context-switch to the user process on the next timer tick.
-            x86_64::instructions::interrupts::enable();
-            loop {
-                x86_64::instructions::hlt();
+    // ── 19. Launch user process from disk FAT32 (/disk/hello) ────────
+    // If the ATA+FAT32 drivers mounted a partition at /disk, load the
+    // embedded ELF from disk and run it. This exercises the full disk
+    // pipeline: ATA PIO → FAT32 → VFS → ELF loader → Ring3 → syscall.
+    let mut launched = false;
+    if crate::ata::disk_present() {
+        println!("[boot] spawning /disk/hello from FAT32 disk...");
+        match userproc::spawn_user_process_from_path("/disk/hello") {
+            Ok(pid) => {
+                println!("[boot] /disk/hello spawned as pid={} (from disk)", pid);
+                launched = true;
+            }
+            Err(e) => {
+                println!("[boot] FAILED to spawn /disk/hello: {}", e);
             }
         }
-        Err(e) => {
-            println!("[boot] FAILED to spawn /bin/hello: {}", e);
-            println!("[boot] falling back to inline Ring3 test...");
-            launch_ring3_test();
+    }
+
+    // ── 19b. Fallback: launch from initramfs tmpfs ───────────────────
+    if !launched {
+        println!("[boot] spawning /bin/hello from tmpfs initramfs...");
+        match userproc::spawn_user_process_from_path("/bin/hello") {
+            Ok(pid) => {
+                println!("[boot] /bin/hello spawned as pid={}", pid);
+                launched = true;
+            }
+            Err(e) => {
+                println!("[boot] FAILED to spawn /bin/hello: {}", e);
+            }
         }
+    }
+
+    // ── 20. Start the scheduler and idle ─────────────────────────────
+    if launched {
+        scheduler::start_scheduler();
+        println!("[boot] scheduler started — entering idle loop");
+        // Enable interrupts and halt forever; the scheduler will
+        // context-switch to the user process on the next timer tick.
+        x86_64::instructions::interrupts::enable();
+        loop {
+            x86_64::instructions::hlt();
+        }
+    } else {
+        println!("[boot] no user process available — falling back to inline Ring3 test...");
+        launch_ring3_test();
     }
 }
 

@@ -200,4 +200,11 @@ pub fn get_fb_state() -> Option<(*mut u8, usize, u32, u32, u32, u32, u32)> {
     ))
 }
 
+/// Convenience accessor: (base_ptr, byte_len) if the framebuffer is mapped.
+pub fn framebuffer_info() -> Option<(*mut u8, usize)> {
+    let state = GRAPHICS.lock();
+    state.info?;
+    Some((state.buffer, state.len))
+}
+
 

@@ -31,6 +31,7 @@ pub mod input;
 pub mod time;
 
 pub use fd::FdTable;
+use alloc::borrow::ToOwned;
 
 /// Syscall vector number for `int 0x80`.
 pub const SYSCALL_VECTOR: u8 = 0x80;
@@ -88,6 +89,16 @@ pub enum SyscallNum {
     Getpid = 13,
     /// `close(fd)` — close a file descriptor.
     Close = 14,
+    /// `mkdir(path)` — create a directory.
+    Mkdir = 15,
+    /// `unlink(path)` — remove a file.
+    Unlink = 16,
+    /// `stat(path, buf)` — get file metadata.
+    Stat = 17,
+    /// `chdir(path)` — change current directory.
+    Chdir = 18,
+    /// `getcwd(buf, size)` — get current working directory.
+    Getcwd = 19,
 }
 
 impl SyscallNum {
@@ -107,6 +118,11 @@ impl SyscallNum {
             12 => Some(Self::Exec),
             13 => Some(Self::Getpid),
             14 => Some(Self::Close),
+            15 => Some(Self::Mkdir),
+            16 => Some(Self::Unlink),
+            17 => Some(Self::Stat),
+            18 => Some(Self::Chdir),
+            19 => Some(Self::Getcwd),
             _ => None,
         }
     }
@@ -203,6 +219,11 @@ pub fn dispatch(
             Some(SyscallNum::Exec) => sys_exec(arg0 as *const u8),
             Some(SyscallNum::Getpid) => sys_getpid(),
             Some(SyscallNum::Close) => sys_close(arg0 as i32),
+            Some(SyscallNum::Mkdir) => sys_mkdir(arg0 as *const u8),
+            Some(SyscallNum::Unlink) => sys_unlink(arg0 as *const u8),
+            Some(SyscallNum::Stat) => sys_stat(arg0 as *const u8, arg1 as *mut StatBuf),
+            Some(SyscallNum::Chdir) => sys_chdir(arg0 as *const u8),
+            Some(SyscallNum::Getcwd) => sys_getcwd(arg0 as *mut u8, arg1),
             None => Errno::enosys.as_i64(),
         }
     }
@@ -637,6 +658,149 @@ unsafe fn sys_close(fd: i32) -> i64 {
     } else {
         Errno::ebadf.as_i64()
     }
+}
+
+/// Read a null-terminated UTF-8 path from user memory. Returns (String, len).
+unsafe fn read_path(path: *const u8) -> Result<alloc::string::String, i64> {
+    if path.is_null() {
+        return Err(Errno::efault.as_i64());
+    }
+    let mut len = 0usize;
+    while *path.add(len) != 0 {
+        len += 1;
+        if len > 255 {
+            return Err(Errno::einval.as_i64());
+        }
+    }
+    let slice = core::slice::from_raw_parts(path, len);
+    core::str::from_utf8(slice)
+        .map(|s| s.to_owned())
+        .map_err(|_| Errno::einval.as_i64())
+}
+
+/// `mkdir(path)` → 0 or negative errno.
+unsafe fn sys_mkdir(path: *const u8) -> i64 {
+    let path_str = match read_path(path) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let vfs = crate::fs::VFS.lock();
+    let (mount_idx, _) = match vfs.find_mount(&path_str) {
+        Some(m) => m,
+        None => return Errno::enoent.as_i64(),
+    };
+    let parent = path_str
+        .rsplit_once('/')
+        .map(|(p, _)| p.to_owned())
+        .unwrap_or_else(|| "/".to_owned());
+    let name = path_str.rsplit('/').next().unwrap_or("").to_owned();
+    let (_, parent_inode) = match vfs.resolve(&parent) {
+        Ok(v) => v,
+        Err(_) => return Errno::enoent.as_i64(),
+    };
+    match vfs.mounts[mount_idx].ops.mkdir(parent_inode, &name) {
+        Ok(_) => 0,
+        Err(_) => Errno::einval.as_i64(),
+    }
+}
+
+/// `unlink(path)` → 0 or negative errno.
+unsafe fn sys_unlink(path: *const u8) -> i64 {
+    let path_str = match read_path(path) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let vfs = crate::fs::VFS.lock();
+    let (mount_idx, _) = match vfs.find_mount(&path_str) {
+        Some(m) => m,
+        None => return Errno::enoent.as_i64(),
+    };
+    let parent = path_str
+        .rsplit_once('/')
+        .map(|(p, _)| p.to_owned())
+        .unwrap_or_else(|| "/".to_owned());
+    let name = path_str.rsplit('/').next().unwrap_or("").to_owned();
+    let (_, parent_inode) = match vfs.resolve(&parent) {
+        Ok(v) => v,
+        Err(_) => return Errno::enoent.as_i64(),
+    };
+    match vfs.mounts[mount_idx].ops.unlink(parent_inode, &name) {
+        Ok(_) => 0,
+        Err(_) => Errno::enoent.as_i64(),
+    }
+}
+
+/// POSIX-style stat structure (as returned to user space).
+#[repr(C)]
+pub struct StatBuf {
+    pub st_size: u64,
+    pub st_mode: u32,
+}
+
+/// `stat(path, buf)` → 0 or negative errno.
+unsafe fn sys_stat(path: *const u8, buf: *mut StatBuf) -> i64 {
+    let path_str = match read_path(path) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    if buf.is_null() {
+        return Errno::efault.as_i64();
+    }
+    let vfs = crate::fs::VFS.lock();
+    let (mount_idx, inode_id) = match vfs.resolve(&path_str) {
+        Ok(v) => v,
+        Err(_) => return Errno::enoent.as_i64(),
+    };
+    let ft = vfs.mounts[mount_idx].ops.file_type(inode_id);
+    let size = vfs.mounts[mount_idx].ops.size(inode_id);
+    let mode = match ft {
+        crate::fs::FileType::Directory => 0o040000, // S_IFDIR
+        crate::fs::FileType::Regular => 0o100000,   // S_IFREG
+        crate::fs::FileType::CharDevice => 0o020000,
+        crate::fs::FileType::BlockDevice => 0o060000,
+    };
+    (*buf).st_size = size;
+    (*buf).st_mode = mode;
+    0
+}
+
+/// Per-process current working directory (single global for now).
+pub static CURRENT_DIR: spin::Mutex<alloc::string::String> =
+    spin::Mutex::new(alloc::string::String::new());
+
+/// `chdir(path)` → 0 or negative errno.
+unsafe fn sys_chdir(path: *const u8) -> i64 {
+    let path_str = match read_path(path) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let vfs = crate::fs::VFS.lock();
+    match vfs.resolve(&path_str) {
+        Ok((m_idx, inode)) => {
+            if vfs.mounts[m_idx].ops.file_type(inode) != crate::fs::FileType::Directory {
+                return -20; // ENOTDIR
+            }
+            let mut cwd = CURRENT_DIR.lock();
+            *cwd = path_str;
+            0
+        }
+        Err(_) => Errno::enoent.as_i64(),
+    }
+}
+
+/// `getcwd(buf, size)` → 0 or negative errno.
+unsafe fn sys_getcwd(buf: *mut u8, size: u64) -> i64 {
+    if buf.is_null() || size == 0 {
+        return Errno::efault.as_i64();
+    }
+    let cwd = CURRENT_DIR.lock();
+    let bytes = cwd.as_bytes();
+    if bytes.len() + 1 > size as usize {
+        return Errno::einval.as_i64();
+    }
+    core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, bytes.len());
+    *buf.add(bytes.len()) = 0;
+    0
 }
 
 

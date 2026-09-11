@@ -6,6 +6,8 @@
 
 #![allow(dead_code)]
 
+pub mod devfs;
+pub mod fat32;
 pub mod initramfs;
 pub mod tmpfs;
 
@@ -65,7 +67,7 @@ pub struct VfsFile {
 
 /// Global VFS state.
 pub struct Vfs {
-    mounts: Vec<Mount>,
+    pub mounts: Vec<Mount>,
 }
 
 impl Vfs {
@@ -82,7 +84,7 @@ impl Vfs {
         self.mounts.sort_by(|a, b| b.mount_point.len().cmp(&a.mount_point.len()));
     }
 
-    fn find_mount<'a>(&'a self, path: &'a str) -> Option<(usize, &'a str)> {
+    pub fn find_mount<'a>(&'a self, path: &'a str) -> Option<(usize, &'a str)> {
         for (i, mount) in self.mounts.iter().enumerate() {
             if path == mount.mount_point || path.starts_with(&format!("{}/", mount.mount_point)) {
                 let relative = if path == mount.mount_point { "" } else { &path[mount.mount_point.len()..] };

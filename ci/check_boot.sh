@@ -66,7 +66,7 @@ ALL_OK=true
 # [OK] = subsystem initialised successfully.
 # [PENDING] = subsystem not yet implemented (kernel still booted to this point).
 # Missing marker = kernel crashed before reaching this subsystem → FAIL.
-for marker in "GDT" "IDT" "PIC" "HEAP" "KEYBOARD" "MOUSE" "GRAPHICS" "TIME" "SYSCALLS" "FLUTTER_ADAPTER" "WINDOW_MANAGER" "EXEC_LOADER" "FLUTTER_SHELL" "SIGNAL_SUBSYS" "OOM_HANDLER" "UHCI_USB" "USB_HID_INPUT" "AERO_APP_FORMAT" "PERMISSION_SUBSYS" "USERMODE" "SCHEDULER" "SIGNAL" "FORK_EXEC"; do
+for marker in "GDT" "IDT" "PIC" "HEAP" "KEYBOARD" "MOUSE" "GRAPHICS" "TIME" "SYSCALLS" "FLUTTER_ADAPTER" "WINDOW_MANAGER" "EXEC_LOADER" "FLUTTER_SHELL" "SIGNAL_SUBSYS" "OOM_HANDLER" "UHCI_USB" "USB_HID_INPUT" "AERO_APP_FORMAT" "PERMISSION_SUBSYS" "USERMODE" "SCHEDULER" "SIGNAL" "FORK_EXEC" "ATA_DISK" "FAT32" "DEVFS"; do
     if grep -q "\[OK\] ${marker}\|\[PENDING\] ${marker}\|\[WARN\] ${marker}" "${OUTPUT_FILE}"; then
         echo "  ✓ ${marker} marker found"
     else
