@@ -50,7 +50,7 @@ timeout "${TIMEOUT_SEC}" qemu-system-x86_64 \
     -display none \
     -no-reboot \
     -monitor none \
-    -device usb-uhci \
+    -device piix3-usb-uhci \
     -usbdevice keyboard \
     -usbdevice mouse \
     2>&1 | tee "${OUTPUT_FILE}" || true
