@@ -86,8 +86,20 @@ impl Vfs {
 
     pub fn find_mount<'a>(&'a self, path: &'a str) -> Option<(usize, &'a str)> {
         for (i, mount) in self.mounts.iter().enumerate() {
-            if path == mount.mount_point || path.starts_with(&format!("{}/", mount.mount_point)) {
-                let relative = if path == mount.mount_point { "" } else { &path[mount.mount_point.len()..] };
+            let matched = if mount.mount_point == "/" {
+                path.starts_with('/')
+            } else {
+                path == mount.mount_point
+                    || path.starts_with(&format!("{}/", mount.mount_point))
+            };
+            if matched {
+                let relative = if path == mount.mount_point {
+                    ""
+                } else if mount.mount_point == "/" {
+                    &path[1..]
+                } else {
+                    &path[mount.mount_point.len()..]
+                };
                 return Some((i, relative));
             }
         }
@@ -111,13 +123,21 @@ impl Vfs {
         Ok((mount_idx, current_inode))
     }
 
+    /// Split `/a/b/c` into (`/a/b`, `c`); `/bin` into (`/`, `bin`); `bin` into (`/`, `bin`).
+    fn split_parent_name<'a>(&self, path: &'a str) -> (&'a str, &'a str) {
+        match path.rfind('/') {
+            Some(0) => ("/", &path[1..]),
+            Some(i) => (&path[..i], &path[i + 1..]),
+            None => ("/", path),
+        }
+    }
+
     pub fn open(&self, path: &str, create: bool) -> Result<VfsFile, &'static str> {
         let (mount_idx, inode_id) = match self.resolve(path) {
             Ok(v) => v,
             Err(_) if create => {
                 let (mount_idx, _) = self.find_mount(path).ok_or("no mount for path")?;
-                let parent = path.rsplit_once('/').map(|(p, _)| p).unwrap_or("/");
-                let name = path.rsplit('/').next().unwrap_or("");
+                let (parent, name) = self.split_parent_name(path);
                 let (_, parent_inode) = self.resolve(parent)?;
                 let new_inode = self.mounts[mount_idx].ops.create(parent_inode, name)?;
                 (mount_idx, new_inode)
@@ -134,8 +154,7 @@ impl Vfs {
         Ok(n)
     }
 
-    pub fn write(&self, file: &mut VfsFile, buf: &[u8]) -> Result<usize, &'static str> {
-        let n = self.mounts[file.mount_idx].ops.write(file.inode_id, file.offset, buf)?;
+    pub fn write(&self, file: &mut VfsFile, buf: &[u8]) -> Result<usize, &'static str> {        let n = self.mounts[file.mount_idx].ops.write(file.inode_id, file.offset, buf)?;
         file.offset += n as u64;
         Ok(n)
     }

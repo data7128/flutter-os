@@ -70,6 +70,7 @@ pub fn spawn_user_process(elf_data: &[u8], name: &[u8]) -> Result<u32, &'static 
         if let Some(proc) = table.get_mut(pid) {
             proc.entry_point = entry;
             proc.user_rsp = stack_top;
+            proc.cr3 = addr_space.pml4_frame.start_address().as_u64();
             proc.state = ProcessState::Ready;
         }
         pid
@@ -293,19 +294,32 @@ fn map_user_stack(addr_space: &AddressSpace) -> Result<u64, &'static str> {
 /// This function is called as the "return address" from the context
 /// switch assembly. It must never return — `enter_usermode` is noreturn.
 extern "C" fn user_trampoline() -> ! {
-    let (entry, user_rsp) = {
+    let (entry, user_rsp, cr3) = {
         let table = PROCESS_TABLE.lock();
         let pid = table.current_pid;
         let proc = table
             .get(pid)
             .expect("user_trampoline: current process not found");
-        (proc.entry_point, proc.user_rsp)
+        (proc.entry_point, proc.user_rsp, proc.cr3)
     };
 
     crate::serial::_print(format_args!(
-        "[trampoline] entering Ring3: entry={:#x}, rsp={:#x}\n",
-        entry, user_rsp
+        "[trampoline] entering Ring3: entry={:#x}, rsp={:#x}, cr3={:#x}\n",
+        entry, user_rsp, cr3
     ));
+
+    // Activate the process's own address space (user PML4). Without this
+    // the user pages (ELF segments, stack) are not mapped and the first
+    // instruction fetch faults.
+    if cr3 != 0 {
+        use x86_64::structures::paging::{PhysFrame, Size4KiB};
+        let frame = PhysFrame::<Size4KiB>::from_start_address(x86_64::PhysAddr::new(cr3))
+            .expect("trampoline: invalid cr3");
+        let addr_space = crate::memory::page_table::AddressSpace { pml4_frame: frame };
+        unsafe {
+            addr_space.switch_to();
+        }
+    }
 
     unsafe {
         crate::syscall_trampoline::enter_usermode(entry, user_rsp);

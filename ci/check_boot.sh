@@ -45,7 +45,7 @@ fi
 # -monitor none  : disable QEMU monitor (non-interactive)
 echo "[qemu] starting..."
 timeout "${TIMEOUT_SEC}" qemu-system-x86_64 \
-    -drive format=raw,file="${IMAGE}" \
+    -drive format=raw,file="${IMAGE}",if=ide \
     -serial stdio \
     -display none \
     -no-reboot \

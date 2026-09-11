@@ -168,20 +168,27 @@ pub fn init() {
 pub fn create_file_with_data(path: &str, data: &[u8]) -> Result<(), &'static str> {
     let vfs = VFS.lock();
     let (mount_idx, _) = vfs.find_mount(path).ok_or("no mount")?;
-    let parent = path.rsplit_once('/').map(|(p, _)| p).unwrap_or("/");
-    let name = path.rsplit('/').next().unwrap_or("");
+    let (parent, name) = split_parent_name(path);
     let (_, parent_inode) = vfs.resolve(parent)?;
     let inode_id = vfs.mounts[mount_idx].ops.create(parent_inode, name)?;
     vfs.mounts[mount_idx].ops.write(inode_id, 0, data)?;
     Ok(())
 }
 
+/// Split `/a/b/c` into (`/a/b`, `c`); `/bin` into (`/`, `bin`); `bin` into (`/`, `bin`).
+fn split_parent_name(path: &str) -> (&str, &str) {
+    match path.rfind('/') {
+        Some(0) => ("/", &path[1..]),
+        Some(i) => (&path[..i], &path[i + 1..]),
+        None => ("/", path),
+    }
+}
+
 /// Create a directory at `path`.
 pub fn mkdir(path: &str) -> Result<(), &'static str> {
     let vfs = VFS.lock();
     let (mount_idx, _) = vfs.find_mount(path).ok_or("no mount")?;
-    let parent = path.rsplit_once('/').map(|(p, _)| p).unwrap_or("/");
-    let name = path.rsplit('/').next().unwrap_or("");
+    let (parent, name) = split_parent_name(path);
     let (_, parent_inode) = vfs.resolve(parent)?;
     vfs.mounts[mount_idx].ops.mkdir(parent_inode, name)?;
     Ok(())

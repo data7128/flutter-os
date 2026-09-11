@@ -107,6 +107,9 @@ pub struct Process {
     pub entry_point: u64,
     /// User-mode stack pointer.
     pub user_rsp: u64,
+    /// Physical address of this process's PML4 (CR3 value). 0 = inherit
+    /// the kernel address space (not yet spawned from an ELF).
+    pub cr3: u64,
     /// File descriptor table.
     pub fd_table: FdTable,
     /// Pending signals (bitmask: bit N = signal N+1 pending).
@@ -128,6 +131,7 @@ impl Process {
             context: SavedContext::zero(),
             entry_point: 0,
             user_rsp: 0,
+            cr3: 0,
             fd_table: FdTable::new(),
             pending_signals: 0,
             signal_mask: 0,
@@ -172,7 +176,12 @@ impl ProcessTable {
                 self.processes[i] = Process {
                     pid,
                     parent_pid,
-                    state: ProcessState::Ready,
+                    // Fresh slots are not runnable until a spawn path
+                    // (exec / spawn_user_process) sets up their kernel
+                    // stack and flips the state to Ready. Keeping them
+                    // Blocked prevents the scheduler from selecting
+                    // placeholders (e.g. boot_service stubs) forever.
+                    state: ProcessState::Blocked,
                     ..Process::empty()
                 };
                 self.processes[i].set_name(name);

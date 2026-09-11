@@ -113,42 +113,55 @@ pub fn drain_mouse() -> (i16, i16, u8) {
 // ── PS/2 controller low-level helpers ──────────────────────────────
 
 /// Wait for the controller input buffer to be empty (ready to write).
-unsafe fn wait_write() {
+/// Returns `false` on timeout (device unresponsive).
+unsafe fn wait_write() -> bool {
     let mut cmd: Port<u8> = Port::new(0x64);
-    loop {
-        if (cmd.read() & 0x02) == 0 {
-            break;
+    for _ in 0..10_000_000 {
+        let s = cmd.read();
+        if (s & 0x02) == 0 {
+            return true;
         }
     }
+    false
 }
 
 /// Wait for the controller output buffer to be full (data ready to read).
-unsafe fn wait_read() {
+/// Returns `false` on timeout (device unresponsive).
+unsafe fn wait_read() -> bool {
     let mut cmd: Port<u8> = Port::new(0x64);
-    loop {
-        if (cmd.read() & 0x01) != 0 {
-            break;
+    for _ in 0..10_000_000 {
+        let s = cmd.read();
+        if (s & 0x01) != 0 {
+            return true;
         }
     }
+    false
 }
 
 /// Send a command byte to the PS/2 controller (port 0x64).
 unsafe fn send_controller_cmd(cmd: u8) {
-    wait_write();
+    if !wait_write() {
+        return;
+    }
     let mut port: Port<u8> = Port::new(0x64);
     port.write(cmd);
 }
 
 /// Send a command byte to the mouse device (via 0xD4 prefix + port 0x60).
-/// Waits for and discards the mouse ACK (0xFA).
-unsafe fn send_mouse_cmd(cmd: u8) {
+/// Waits for and discards the mouse ACK (0xFA). Returns `false` on timeout.
+unsafe fn send_mouse_cmd(cmd: u8) -> bool {
     send_controller_cmd(0xD4); // "write to auxiliary device"
-    wait_write();
+    if !wait_write() {
+        return false;
+    }
     let mut data: Port<u8> = Port::new(0x60);
     data.write(cmd);
-    wait_read();
+    if !wait_read() {
+        return false;
+    }
     let mut data: Port<u8> = Port::new(0x60);
     let _ack = data.read(); // Mouse ACKs with 0xFA
+    true
 }
 
 /// Initialise the PS/2 mouse: enable auxiliary port, set config,
@@ -156,41 +169,74 @@ unsafe fn send_mouse_cmd(cmd: u8) {
 ///
 /// **Hardware-only** — no GUI logic here.
 ///
-/// [MANUAL] This sequence needs testing on real hardware / QEMU.
-/// The timing of ACK responses can vary. If the mouse is not
-/// present, the function logs a warning but doesn't panic.
+/// The whole sequence runs with interrupts disabled: every PS/2
+/// controller reply (ACK, config byte) lands in the 0x60 output buffer
+/// and is consumed synchronously here. If IRQs were on, a keyboard IRQ1
+/// could steal the byte (QEMU raises IRQ1 for controller replies), the
+/// OBF flag gets cleared by the keyboard handler, and our wait_read
+/// would spin forever. After setup we re-enable IRQs and let IRQ12
+/// deliver mouse packets.
 pub fn init() {
-    unsafe {
-        // 1. Enable the auxiliary (mouse) port on the controller.
-        send_controller_cmd(0xA8);
-
-        // 2. Read the current controller configuration byte.
-        send_controller_cmd(0x20);
-        wait_read();
-        let mut data: Port<u8> = Port::new(0x60);
-        let mut config = data.read();
-
-        // 3. Modify config: enable IRQ12 (bit 1), enable aux clock (bit 5),
-        //    disable translation (clear bit 6) — we want raw mouse packets.
-        config |= 0x02 | 0x20;
-        config &= !0x40;
-
-        // 4. Write back the modified config.
-        send_controller_cmd(0x60);
-        wait_write();
-        let mut data: Port<u8> = Port::new(0x60);
-        data.write(config);
-
-        // 5. Reset the mouse and wait for its self-test result.
-        send_mouse_cmd(0xFF);
-
-        // 6. Set sample rate to 60 samples/sec.
-        send_mouse_cmd(0xF3); // "set sample rate"
-        send_mouse_cmd(60);
-
-        // 7. Enable packet streaming — mouse will start sending IRQ12.
-        send_mouse_cmd(0xF4);
-
+    // Talk to the controller synchronously; see doc comment above.
+    x86_64::instructions::interrupts::disable();
+    let ok = unsafe { configure_mouse() };
+    x86_64::instructions::interrupts::enable();
+    if ok {
         crate::serial::_print(format_args!("[mouse] PS/2 mouse initialised\n"));
+    } else {
+        crate::serial::_print(format_args!(
+            "[mouse] WARN: PS/2 mouse not responding (continuing without it)\n"
+        ));
     }
+}
+
+/// Run the PS/2 mouse configuration sequence. Returns `false` (without
+/// aborting) when the device does not answer, so boot never hangs.
+unsafe fn configure_mouse() -> bool {
+    let mut cmd: Port<u8> = Port::new(0x64);
+
+    // 1. Enable the auxiliary (mouse) port on the controller.
+    send_controller_cmd(0xA8);
+
+    // 2. Read the current controller configuration byte.
+    send_controller_cmd(0x20);
+    if !wait_read() {
+        return false;
+    }
+    let mut data: Port<u8> = Port::new(0x60);
+    let mut config = data.read();
+
+    // 3. Modify config: enable IRQ12 (bit 1), enable aux clock (bit 5),
+    //    disable translation (clear bit 6) — we want raw mouse packets.
+    config |= 0x02 | 0x20;
+    config &= !0x40;
+
+    // 4. Write back the modified config.
+    send_controller_cmd(0x60);
+    wait_write();
+    let mut data: Port<u8> = Port::new(0x60);
+    data.write(config);
+
+    // 5. Reset the mouse and wait for its self-test result.
+    if !send_mouse_cmd(0xFF) {
+        return false;
+    }
+
+    // 6. Set sample rate to 60 samples/sec.
+    if !send_mouse_cmd(0xF3) || !send_mouse_cmd(60) {
+        return false;
+    }
+
+    // 7. Enable packet streaming — mouse will start sending IRQ12.
+    if !send_mouse_cmd(0xF4) {
+        return false;
+    }
+    // Drain any residual byte (e.g. the 0xAA self-test answer) so the
+    // interrupt handlers don't mistake it for a packet later.
+    let s = cmd.read();
+    if s & 0x01 != 0 {
+        let mut data: Port<u8> = Port::new(0x60);
+        let _ = data.read();
+    }
+    true
 }

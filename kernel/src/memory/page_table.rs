@@ -126,12 +126,17 @@ impl AddressSpace {
 
         let new_pml4 = unsafe { &mut *(pml4_virt.as_mut_ptr::<PageTable>()) };
 
-        // Copy kernel higher-half entries from the active PML4.
+        // Copy the kernel's PML4 entries into the new user address space.
+        // The bootloader maps the kernel at 0x8000_0000_0000, which lives
+        // in PML4 index 4 — NOT the conventional higher-half (index
+        // 256..512) — so we copy the entire table. User pages are added
+        // afterwards by map_user_page; supervisor PTE flags keep kernel
+        // memory inaccessible from Ring3.
         let kernel_pml4_phys = x86_64::registers::control::Cr3::read().0.start_address();
         let kernel_pml4_virt = VirtAddr::new(phys_offset + kernel_pml4_phys.as_u64());
         let kernel_pml4 = unsafe { &*(kernel_pml4_virt.as_ptr::<PageTable>()) };
 
-        for i in 256..512 {
+        for i in 0..512 {
             new_pml4[i] = kernel_pml4[i].clone();
         }
 

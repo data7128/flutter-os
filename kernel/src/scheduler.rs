@@ -232,14 +232,11 @@ pub fn schedule() {
 
 /// Perform a context switch from `old_pid` to `new_pid`.
 fn do_context_switch(old_pid: u32, new_pid: u32) {
-    let old_slot = match find_slot(old_pid) {
-        Some(s) => s,
-        None => return,
-    };
     let new_slot = match find_slot(new_pid) {
         Some(s) => s,
         None => return,
     };
+    let old_slot = if old_pid == 0 { None } else { find_slot(old_pid) };
 
     let mut stacks = KERNEL_STACKS.lock();
 
@@ -247,7 +244,16 @@ fn do_context_switch(old_pid: u32, new_pid: u32) {
     if !stacks[new_slot].initialised {
         // The entry point for a fresh process is `trampoline_to_user`,
         // which does the iretq to Ring3. We set it up when the process
-        // is created, but if not, skip.
+        // is created, but if not, skip. Mark it Blocked so the next
+        // scan doesn't pick the same placeholder again and spin.
+        {
+            let mut table = PROCESS_TABLE.lock();
+            if let Some(p) = table.get_mut(new_pid) {
+                if p.state == ProcessState::Ready {
+                    p.state = ProcessState::Blocked;
+                }
+            }
+        }
         crate::serial::_print(format_args!(
             "[sched] new process pid={} has no initial context — skipping\n",
             new_pid
@@ -256,14 +262,24 @@ fn do_context_switch(old_pid: u32, new_pid: u32) {
     }
 
     let new_rsp = stacks[new_slot].saved_rsp;
-    let old_rsp_ptr = &mut stacks[old_slot].saved_rsp as *mut u64;
+    // When there is no previous process (first ever switch from the idle
+    // kernel loop), save the "old" context into a throwaway slot — the
+    // switch_context asm still pushes/pops there and we simply never
+    // switch back to it.
+    let mut idle_saved: u64 = 0;
+    let old_rsp_ptr: *mut u64 = match old_slot {
+        Some(s) => &mut stacks[s].saved_rsp as *mut u64,
+        None => &mut idle_saved as *mut u64,
+    };
 
     // Update process states.
     {
         let mut table = PROCESS_TABLE.lock();
-        if let Some(p) = table.get_mut(old_pid) {
-            if p.state == ProcessState::Running {
-                p.state = ProcessState::Ready;
+        if let Some(_) = old_slot {
+            if let Some(p) = table.get_mut(old_pid) {
+                if p.state == ProcessState::Running {
+                    p.state = ProcessState::Ready;
+                }
             }
         }
         if let Some(p) = table.get_mut(new_pid) {
@@ -272,8 +288,12 @@ fn do_context_switch(old_pid: u32, new_pid: u32) {
         table.current_pid = new_pid;
     }
 
-    // Reset time slice.
-    SCHEDULER.lock().current_slice = SCHEDULER.lock().default_slice;
+    // Reset time slice. (Single lock acquisition — spin locks are not
+    // re-entrant, and the old `lock().x = lock().y` form deadlocked here.)
+    {
+        let mut sched = SCHEDULER.lock();
+        sched.current_slice = sched.default_slice;
+    }
 
     // Switch TSS.RSP0 to the new process's kernel stack top.
     // This ensures that if the new process triggers an interrupt/syscall
@@ -281,6 +301,11 @@ fn do_context_switch(old_pid: u32, new_pid: u32) {
     unsafe {
         set_tss_rsp0(stacks[new_slot].stack_top());
     }
+
+    // Drop the stacks lock before the actual switch: the spin lock would
+    // otherwise stay held across the whole time slice and deadlock the
+    // next timer tick (which also takes KERNEL_STACKS).
+    drop(stacks);
 
     // Perform the actual register/stack switch.
     unsafe {

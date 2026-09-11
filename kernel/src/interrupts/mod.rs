@@ -29,6 +29,11 @@ pub enum InterruptIndex {
     Keyboard = PIC_1_OFFSET + 1,
     /// IRQ12 — PS/2 mouse (secondary PIC, line 4).
     Mouse = PIC_2_OFFSET + 4,
+    /// IRQ14 — primary IDE channel. Not used (we poll), but we install a
+    /// handler + keep it masked so an IDE interrupt can never fault.
+    IdePrimary = PIC_2_OFFSET + 6,
+    /// IRQ15 — secondary IDE channel (spare, same treatment).
+    IdeSecondary = PIC_2_OFFSET + 7,
 }
 
 impl InterruptIndex {
@@ -88,6 +93,12 @@ pub fn init() {
     idt::init();
     unsafe {
         PICS.lock().initialize();
+        // Explicitly mask every IRQ except timer/keyboard/mouse/cascade.
+        // The bootloader may leave other lines (e.g. IRQ14 IDE) unmasked,
+        // and an unexpected device interrupt with no IDT entry would
+        // double-fault the kernel. Mask them all up front; `enable_input`
+        // re-opens exactly the ones we need.
+        PICS.lock().write_masks(0b1111_1000, 0b1110_1111);
     }
     x86_64::instructions::interrupts::enable();
 }

@@ -41,6 +41,9 @@ lazy_static! {
         idt[InterruptIndex::Timer.as_u8()].set_handler_fn(timer_interrupt_handler);
         idt[InterruptIndex::Keyboard.as_u8()].set_handler_fn(keyboard_interrupt_handler);
         idt[InterruptIndex::Mouse.as_u8()].set_handler_fn(mouse_interrupt_handler);
+        // IDE channel interrupts (kept masked; handler is a safety net).
+        idt[InterruptIndex::IdePrimary.as_u8()].set_handler_fn(ide_interrupt_handler);
+        idt[InterruptIndex::IdeSecondary.as_u8()].set_handler_fn(ide_interrupt_handler);
 
         // ── Syscall (int 0x80, DPL=3) ──────────────────────────────
         // The trampoline is a naked assembly function; transmute its
@@ -94,7 +97,7 @@ extern "x86-interrupt" fn page_fault_handler(
 
     // If the fault came from user mode (CS RPL = 3), deliver SIGSEGV.
     let cs = stack_frame.code_segment;
-    if cs.index() & 3 == 3 {
+    if cs.rpl() == x86_64::PrivilegeLevel::Ring3 {
         println!("[int] page fault in user mode — killing current process");
         let pid = crate::process::PROCESS_TABLE.lock().current_pid;
         crate::process::PROCESS_TABLE.lock().mark_exit(pid, 139); // SIGSEGV = 139
@@ -169,5 +172,14 @@ extern "x86-interrupt" fn mouse_interrupt_handler(_stack_frame: InterruptStackFr
 
     unsafe {
         PICS.lock().notify_end_of_interrupt(InterruptIndex::Mouse.as_u8());
+    }
+}
+
+/// Defensive handler for IDE channel interrupts. The ATA driver polls
+/// (PIO) and the lines are kept masked, but if an IDE IRQ ever arrives
+/// we must ack it instead of leaving the PIC waiting forever.
+extern "x86-interrupt" fn ide_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    unsafe {
+        PICS.lock().notify_end_of_interrupt(InterruptIndex::IdePrimary.as_u8());
     }
 }

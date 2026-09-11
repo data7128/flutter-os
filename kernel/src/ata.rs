@@ -242,8 +242,12 @@ pub fn detect() -> bool {
         for i in 0..256 {
             ident[i] = data.read();
         }
-        // Word 0 bit 0: device present.
-        if ident[0] & 1 == 0 {
+        // Word 0 bit 0 (ATAPI/response flags) is not a reliable presence
+        // probe — real devices (incl. QEMU) return 0x40 there. Presence is
+        // already established: no ERR, DRQ asserted, and we read 256 words
+        // back. Just sanity-check the LBA support bit instead.
+        if ident[49] & (1 << 9) == 0 {
+            // LBA supported bit missing — treat as "not a disk we handle".
             return false;
         }
         // Total sectors: words 60-61 (28-bit LBA).
