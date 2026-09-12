@@ -1,11 +1,24 @@
 //! initramfs — embedded initial filesystem populated at boot.
 //!
-//! Contains a minimal user-mode ELF program (`/bin/hello`) that is
-//! written into the root tmpfs during kernel initialisation. This
-//! demonstrates the full VFS → execve → Ring3 user process pipeline
-//! without requiring a real disk driver.
+//! Populates the root tmpfs with user-mode ELF programs (`/bin/hello`,
+//! `/bin/forktest`, `/bin/sysutils`) and `/README` during kernel
+//! initialisation. Demonstrates the full VFS → execve → Ring3 user
+//! process pipeline without requiring a real disk driver.
 
 use super::tmpfs;
+
+/// Precompiled sysutils ELF (user/sysutils.elf, produced from the
+/// sysutils crate). MUST stay in sync with `build.rs::SYSUTILS_ELF`.
+/// Rebuild with:
+/// ```sh
+/// RUSTFLAGS="-C relocation-model=static -C link-arg=-Tsysutils/linker.ld" \
+///   cargo build -p sysutils --target x86_64-unknown-none --release
+/// cp target/x86_64-unknown-none/release/sysutils user/sysutils.elf
+/// ```
+pub const SYSUTILS_ELF: &[u8] = include_bytes!("../../../user/sysutils.elf");
+
+/// A short readme written to /README.
+pub const README_TEXT: &[u8] = b"AeroOS - a hobby x86_64 kernel in Rust.\nFeatures: serial/VGA console, PS/2 input, ATA PIO disk, FAT32, ELF loader,\npreemptive scheduler, fork/exec/waitpid, signals, and sysutils user-space\ntools (ls/cat/ps/kill). Boot: hello + sysutils (Ring3).\n";
 
 /// Minimal x86_64 ELF64 user program: write("Hello from /bin/hello!\n") then exit(0).
 /// Uses int 0x80 with the AeroOS syscall numbers (write=3, exit=11).
@@ -84,9 +97,23 @@ pub fn init() {
         return;
     }
 
+    // Write /bin/sysutils ELF (precompiled user-space tools).
+    if let Err(e) = tmpfs::create_file_with_data("/bin/sysutils", SYSUTILS_ELF) {
+        crate::serial::_print(format_args!("[initramfs] write /bin/sysutils failed: {}\n", e));
+        return;
+    }
+
+    // Write /README.
+    if let Err(e) = tmpfs::create_file_with_data("/README", README_TEXT) {
+        crate::serial::_print(format_args!("[initramfs] write /README failed: {}\n", e));
+        return;
+    }
+
     crate::serial::_print(format_args!(
-        "[initramfs] populated /bin/hello ({} bytes ELF64), /bin/forktest ({} bytes ELF64)\n",
+        "[initramfs] populated /bin/hello ({}B), /bin/forktest ({}B), /bin/sysutils ({}B), /README ({}B)\n",
         HELLO_ELF.len(),
-        FORKTEST_ELF.len()
+        FORKTEST_ELF.len(),
+        SYSUTILS_ELF.len(),
+        README_TEXT.len()
     ));
 }

@@ -39,6 +39,37 @@ pub const USER_STACK_GUARD: u64 = 4096;
 /// # Returns
 /// - `Ok(pid)` on success
 /// - `Err(&str)` on failure
+/// Load an ELF into a freshly created user address space: parse, create
+/// the space, map every PT_LOAD segment and map the user stack.
+///
+/// Returns (address_space, entry_point, stack_top). Used by both `spawn`
+/// (new process) and `exec` (replace current process image).
+pub(crate) fn load_elf_into_new_space(
+    elf_data: &[u8],
+) -> Result<(AddressSpace, u64, u64), &'static str> {
+    let (entry, segments) = parse_elf_segments(elf_data)?;
+
+    crate::serial::_print(format_args!(
+        "[exec] loading ELF: entry={:#x}, {} segments, data_len={}\n",
+        entry,
+        segments.len(),
+        elf_data.len()
+    ));
+    for (i, sg) in segments.iter().enumerate() {
+        crate::serial::_print(format_args!(
+            "[exec]   seg{} vaddr={:#x} off={:#x} filesz={:#x} memsz={:#x} fl={:#x}\n",
+            i, sg.vaddr, sg.offset, sg.filesz, sg.memsz, sg.flags
+        ));
+    }
+
+    let addr_space = AddressSpace::new_user()?;
+    for seg in &segments {
+        map_elf_segment(&addr_space, elf_data, seg)?;
+    }
+    let stack_top = map_user_stack(&addr_space)?;
+    Ok((addr_space, entry, stack_top))
+}
+
 pub fn spawn_user_process(elf_data: &[u8], name: &[u8]) -> Result<u32, &'static str> {
     // 1. Parse and validate the ELF header.
     let (entry, segments) = parse_elf_segments(elf_data)?;
@@ -106,7 +137,7 @@ pub fn spawn_user_process(elf_data: &[u8], name: &[u8]) -> Result<u32, &'static 
 
 /// Parsed ELF loadable segment.
 #[derive(Debug, Clone, Copy)]
-struct ElfSegment {
+pub(crate) struct ElfSegment {
     pub vaddr: u64,
     pub offset: u64,
     pub filesz: u64,
@@ -115,7 +146,7 @@ struct ElfSegment {
 }
 
 /// Parse ELF header and return entry point + list of PT_LOAD segments.
-fn parse_elf_segments(elf_data: &[u8]) -> Result<(u64, alloc::vec::Vec<ElfSegment>), &'static str> {
+pub(crate) fn parse_elf_segments(elf_data: &[u8]) -> Result<(u64, alloc::vec::Vec<ElfSegment>), &'static str> {
     if elf_data.len() < 64 {
         return Err("ELF too small");
     }
@@ -170,8 +201,16 @@ fn parse_elf_segments(elf_data: &[u8]) -> Result<(u64, alloc::vec::Vec<ElfSegmen
             memsz: p_memsz,
             flags: p_flags,
         });
+        crate::serial::_print(format_args!(
+            "[parse] phdr[{}] type={} vaddr={:#x} off={:#x} filesz={:#x} memsz={:#x} fl={:#x}\n",
+            i, p_type, p_vaddr, p_offset, p_filesz, p_memsz, p_flags
+        ));
     }
 
+    crate::serial::_print(format_args!(
+        "[parse] e_phoff={} e_phentsize={} e_phnum={} data_len={}\n",
+        e_phoff, e_phentsize, e_phnum, elf_data.len()
+    ));
     Ok((e_entry, segments))
 }
 
@@ -180,7 +219,7 @@ fn parse_elf_segments(elf_data: &[u8]) -> Result<(u64, alloc::vec::Vec<ElfSegmen
 /// Allocates physical frames for each page in the segment, maps them at
 /// the segment's virtual address, copies the file data, and zero-fills
 /// the BSS portion (memsz - filesz).
-fn map_elf_segment(
+pub(crate) fn map_elf_segment(
     addr_space: &AddressSpace,
     elf_data: &[u8],
     seg: &ElfSegment,
@@ -209,16 +248,30 @@ fn map_elf_segment(
 
     // Iterate over each page in the segment.
     for page in Page::range_inclusive(start_page, end_page) {
-        // Allocate a physical frame and map it.
-        let frame = addr_space
-            .map_user_page_alloc(page, flags)
-            .map_err(|_| "failed to map ELF page")?;
+        // Reuse an already-mapped page (overlapping ELF segments) or
+        // allocate a fresh frame. ELF loaders must handle segments that
+        // share a page (e.g. the compiler emitting a text page that also
+        // contains the start of .rodata).
+        let tr = addr_space.translate(page.start_address().as_u64());
+        let reused = tr.is_some();
+        let frame = match tr {
+            Some(pa) => x86_64::structures::paging::PhysFrame::<Size4KiB>::from_start_address(pa)
+                .map_err(|_| "failed to map ELF page")?,
+            None => addr_space
+                .map_user_page_alloc(page, flags)
+                .map_err(|_| "failed to map ELF page")?,
+        };
 
-        // Zero the frame first (through the physical-offset mapping).
+        // Zero a freshly allocated frame. IMPORTANT: do NOT zero a reused
+        // frame — an overlapping segment (e.g. .text page that also holds
+        // the start of .rodata) already copied its data there; zeroing it
+        // again would wipe the code and make the user trip on 0x00 bytes.
         let phys_offset = *crate::memory::page_table::PHYSICAL_OFFSET.lock();
         let frame_virt = VirtAddr::new(phys_offset + frame.start_address().as_u64());
-        unsafe {
-            core::ptr::write_bytes(frame_virt.as_mut_ptr::<u8>(), 0, 4096);
+        if !reused {
+            unsafe {
+                core::ptr::write_bytes(frame_virt.as_mut_ptr::<u8>(), 0, 4096);
+            }
         }
 
         // Calculate how much file data goes into this page.
@@ -242,11 +295,23 @@ fn map_elf_segment(
             let copy_len = (file_end_in_seg - file_start_in_seg) as usize;
 
             if (src_offset as usize + copy_len) <= elf_data.len() {
-                let dst_offset = if page_start_vaddr > seg.vaddr {
-                    (page_start_vaddr - seg.vaddr) as usize
+                // Destination offset within this page's frame = the
+                // page-internal offset of the data start, i.e.
+                // (data_start_vaddr & 0xfff). Two past bugs here:
+                //   1. Using the in-segment offset (page_start - seg.vaddr)
+                //      — for the 2nd+ page of a segment that is >= 0x1000,
+                //      writing past the frame into the next physical frame
+                //      and clobbering the page-table frame below.
+                //   2. Using 0 unconditionally — for a non-page-aligned
+                //      segment start (e.g. .rodata at 0x401fa0), the data
+                //      was written at frame offset 0, overwriting the code
+                //      at the start of that page.
+                let data_start_vaddr = if page_start_vaddr < seg.vaddr {
+                    seg.vaddr
                 } else {
-                    0
+                    page_start_vaddr
                 };
+                let dst_offset = (data_start_vaddr & 0xfff) as usize;
                 let dst_ptr = unsafe { frame_virt.as_mut_ptr::<u8>().add(dst_offset) };
                 let src_ptr = unsafe { elf_data.as_ptr().add(src_offset as usize) };
                 unsafe {
@@ -264,12 +329,16 @@ fn map_elf_segment(
 ///
 /// Maps `USER_STACK_SIZE` bytes at `USER_STACK_TOP - size`, with a guard
 /// page below. Returns the stack top (initial RSP).
-fn map_user_stack(addr_space: &AddressSpace) -> Result<u64, &'static str> {
+pub(crate) fn map_user_stack(addr_space: &AddressSpace) -> Result<u64, &'static str> {
     let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
 
     let stack_bottom = USER_STACK_TOP - USER_STACK_SIZE;
     let start_page = Page::<Size4KiB>::containing_address(VirtAddr::new(stack_bottom));
-    let end_page = Page::<Size4KiB>::containing_address(VirtAddr::new(USER_STACK_TOP - 1));
+    // Map the top page too: user entry code (e.g. sysutils `_start`)
+    // reads argc/argv from [rsp] with rsp == USER_STACK_TOP, so that
+    // address must be readable/writable. USER_STACK_TOP is page-aligned,
+    // so this adds exactly one page.
+    let end_page = Page::<Size4KiB>::containing_address(VirtAddr::new(USER_STACK_TOP));
 
     for page in Page::range_inclusive(start_page, end_page) {
         addr_space
@@ -293,7 +362,7 @@ fn map_user_stack(addr_space: &AddressSpace) -> Result<u64, &'static str> {
 /// # Safety
 /// This function is called as the "return address" from the context
 /// switch assembly. It must never return — `enter_usermode` is noreturn.
-extern "C" fn user_trampoline() -> ! {
+pub(crate) extern "C" fn user_trampoline() -> ! {
     let (entry, user_rsp, cr3) = {
         let table = PROCESS_TABLE.lock();
         let pid = table.current_pid;

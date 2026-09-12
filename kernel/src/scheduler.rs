@@ -304,6 +304,19 @@ pub fn yield_now() {
     }
 }
 
+/// Restart the current process from its (rebuilt) kernel-stack context.
+///
+/// Used by `exec`: after the process image and kernel-stack context are
+/// replaced, this switches into the new context, which re-enters Ring3
+/// at the new entry point. The old (pre-exec) user-mode context is
+/// discarded — the syscall that called this never returns.
+pub fn restart_current() {
+    let current = PROCESS_TABLE.lock().current_pid;
+    if current != 0 {
+        do_context_switch(current, current);
+    }
+}
+
 /// Perform a context switch from `old_pid` to `new_pid`.
 fn do_context_switch(old_pid: u32, new_pid: u32) {
     let new_slot = match find_slot(new_pid) {

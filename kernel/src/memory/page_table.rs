@@ -289,10 +289,20 @@ impl AddressSpace {
         let mut mapper = unsafe { OffsetPageTable::new(user_pml4, VirtAddr::new(phys_offset)) };
 
         unsafe {
-            mapper
-                .map_to(page, frame, flags, &mut *alloc)
-                .map_err(|_| "user map_to failed")?
-                .flush();
+            match mapper.map_to(page, frame, flags, &mut *alloc) {
+                Ok(flush) => {
+                    flush.flush();
+                }
+                Err(e) => {
+                    crate::serial::_print(format_args!(
+                        "[map] map_to({:#x}->{:#x}) failed: {:?}\n",
+                        page.start_address().as_u64(),
+                        frame.start_address().as_u64(),
+                        e
+                    ));
+                    return Err("user map_to failed");
+                }
+            }
         }
         Ok(())
     }
@@ -322,5 +332,105 @@ impl AddressSpace {
             return Err(e);
         }
         Ok(frame)
+    }
+}
+
+impl AddressSpace {
+    /// Translate a user virtual address through this address space's page
+    /// tables, returning the physical address. None if unmapped.
+    pub fn translate(&self, vaddr: u64) -> Option<PhysAddr> {
+        let phys_offset = *PHYSICAL_OFFSET.lock();
+        let l4i = ((vaddr >> 39) & 0x1ff) as usize;
+        let l3i = ((vaddr >> 30) & 0x1ff) as usize;
+        let l2i = ((vaddr >> 21) & 0x1ff) as usize;
+        let l1i = ((vaddr >> 12) & 0x1ff) as usize;
+
+        let pml4 = unsafe { &*(VirtAddr::new(phys_offset + self.pml4_frame.start_address().as_u64()).as_ptr::<PageTable>()) };
+        let e4 = pml4[l4i].clone();
+        if !e4.flags().contains(PageTableFlags::PRESENT) {
+            return None;
+        }
+        let pdpt = unsafe { &*(VirtAddr::new(phys_offset + e4.addr().as_u64()).as_ptr::<PageTable>()) };
+        let e3 = pdpt[l3i].clone();
+        if !e3.flags().contains(PageTableFlags::PRESENT) {
+            return None;
+        }
+        if e3.flags().contains(PageTableFlags::HUGE_PAGE) {
+            return Some(PhysAddr::new(e3.addr().as_u64() + (vaddr & 0x3fff_ffff)));
+        }
+        let pd = unsafe { &*(VirtAddr::new(phys_offset + e3.addr().as_u64()).as_ptr::<PageTable>()) };
+        let e2 = pd[l2i].clone();
+        if !e2.flags().contains(PageTableFlags::PRESENT) {
+            return None;
+        }
+        if e2.flags().contains(PageTableFlags::HUGE_PAGE) {
+            return Some(PhysAddr::new(e2.addr().as_u64() + (vaddr & 0x1f_ffff)));
+        }
+        let pt = unsafe { &*(VirtAddr::new(phys_offset + e2.addr().as_u64()).as_ptr::<PageTable>()) };
+        let e1 = pt[l1i].clone();
+        if !e1.flags().contains(PageTableFlags::PRESENT) {
+            return None;
+        }
+        Some(PhysAddr::new(e1.addr().as_u64() + (vaddr & 0xfff)))
+    }
+
+    /// Free every physical frame owned by this address space's USER region
+    /// (PML4 index 0: user pages + their page tables + the PML4 itself).
+    /// Kernel entries (indices 1..511) are shared and never freed here.
+    ///
+    /// Used when a process is reaped (waitpid) or replaced (exec).
+    pub fn dealloc_user(&self) {
+        let phys_offset = *PHYSICAL_OFFSET.lock();
+        let dealloc = |pa: u64| {
+            if let Ok(frame) = PhysFrame::<Size4KiB>::from_start_address(PhysAddr::new(pa)) {
+                crate::memory::frame_allocator::dealloc_frame(frame);
+            }
+        };
+
+        let pml4_virt = VirtAddr::new(phys_offset + self.pml4_frame.start_address().as_u64());
+        let pml4 = unsafe { &mut *(pml4_virt.as_mut_ptr::<PageTable>()) };
+
+        // User region = PML4 index 0.
+        let e4 = pml4[0].clone();
+        if !e4.flags().contains(PageTableFlags::PRESENT) {
+            dealloc(self.pml4_frame.start_address().as_u64());
+            return;
+        }
+        let pdpt_virt = VirtAddr::new(phys_offset + e4.addr().as_u64());
+        let pdpt = unsafe { &mut *(pdpt_virt.as_mut_ptr::<PageTable>()) };
+        for l3i in 0..512 {
+            let e3 = pdpt[l3i].clone();
+            if !e3.flags().contains(PageTableFlags::PRESENT) {
+                continue;
+            }
+            if e3.flags().contains(PageTableFlags::HUGE_PAGE) {
+                // 1 GiB huge page — we never allocate these, skip.
+                continue;
+            }
+            let pd_virt = VirtAddr::new(phys_offset + e3.addr().as_u64());
+            let pd = unsafe { &mut *(pd_virt.as_mut_ptr::<PageTable>()) };
+            for l2i in 0..512 {
+                let e2 = pd[l2i].clone();
+                if !e2.flags().contains(PageTableFlags::PRESENT) {
+                    continue;
+                }
+                if e2.flags().contains(PageTableFlags::HUGE_PAGE) {
+                    // 2 MiB huge page — we never allocate these, skip.
+                    continue;
+                }
+                let pt_virt = VirtAddr::new(phys_offset + e2.addr().as_u64());
+                let pt = unsafe { &mut *(pt_virt.as_mut_ptr::<PageTable>()) };
+                for l1i in 0..512 {
+                    let e1 = pt[l1i].clone();
+                    if e1.flags().contains(PageTableFlags::PRESENT) {
+                        dealloc(e1.addr().as_u64());
+                    }
+                }
+                dealloc(e2.addr().as_u64()); // PT frame
+            }
+            dealloc(e3.addr().as_u64()); // PD frame
+        }
+        dealloc(e4.addr().as_u64()); // PDPT frame
+        dealloc(self.pml4_frame.start_address().as_u64()); // PML4 frame
     }
 }

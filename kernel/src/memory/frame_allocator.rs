@@ -67,12 +67,23 @@ impl BootInfoFrameAllocator {
     }
 
     /// Allocate one physical frame. Returns the frame start address.
+    ///
+    /// The frame is zeroed before it is returned. This is critical for
+    /// page-table frames: `x86_64` 0.14's `map_to` allocates intermediate
+    /// page-table frames through this allocator and relies on them being
+    /// clean — a reused frame with stale entries makes `map_to` report
+    /// `PageAlreadyMapped` for a brand-new virtual page.
     pub fn allocate_frame(&mut self) -> Option<PhysAddr> {
         if self.top == 0 {
             return None;
         }
         self.top -= 1;
-        Some(PhysAddr::new(self.free_stack[self.top]))
+        let pa = self.free_stack[self.top];
+        let po = *crate::memory::page_table::PHYSICAL_OFFSET.lock();
+        unsafe {
+            core::ptr::write_bytes((po + pa) as *mut u8, 0, 4096);
+        }
+        Some(PhysAddr::new(pa))
     }
 
     /// Deallocate a physical frame.

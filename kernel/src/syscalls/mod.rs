@@ -32,6 +32,7 @@ pub mod time;
 
 pub use fd::FdKind;
 pub use fd::FdTable;
+use crate::userproc::USER_STACK_TOP;
 use alloc::borrow::ToOwned;
 
 /// Syscall vector number for `int 0x80`.
@@ -108,6 +109,10 @@ pub enum SyscallNum {
     Waitpid = 21,
     /// `getppid()` — return the parent process ID.
     Getppid = 22,
+    /// `getdents(path, buf, count)` — list a directory.
+    /// arg0 = path pointer, arg1 = user buffer, arg2 = buffer size.
+    /// Returns bytes written (n * 72) or a negative errno.
+    Getdents = 23,
 }
 
 impl SyscallNum {
@@ -246,7 +251,8 @@ pub fn dispatch(
             Some(SyscallNum::PollInput) => sys_poll_input(arg0),
             Some(SyscallNum::Kill) => sys_kill(arg0 as u32, arg1 as u8),
             Some(SyscallNum::Exit) => sys_exit(arg0 as i32),
-            Some(SyscallNum::Exec) => sys_exec(arg0 as *const u8),
+            Some(SyscallNum::Exec) => sys_exec(arg0 as *const u8, arg1 as *const u64),
+            Some(SyscallNum::Getdents) => sys_getdents(arg0 as *const u8, arg1 as *mut u8, arg2 as u64),
             Some(SyscallNum::Getpid) => sys_getpid(),
             Some(SyscallNum::Close) => sys_close(arg0 as i32),
             Some(SyscallNum::Mkdir) => sys_mkdir(arg0 as *const u8),
@@ -634,7 +640,7 @@ unsafe fn sys_exit(status: i32) -> ! {
 /// `exec(path)` → 0 on success, negative errno on failure.
 ///
 /// Loads an ELF executable and prepares a new process.
-unsafe fn sys_exec(path: *const u8) -> i64 {
+unsafe fn sys_exec(path: *const u8, argv: *const u64) -> i64 {
     if path.is_null() {
         return Errno::efault.as_i64();
     }
@@ -662,17 +668,187 @@ unsafe fn sys_exec(path: *const u8) -> i64 {
         return Errno::einval.as_i64();
     }
 
-    // Delegate to the user process loader: read ELF from VFS and spawn.
-    match crate::userproc::spawn_user_process_from_path(path_str) {
-        Ok(pid) => {
-            crate::serial::_print(format_args!("[exec] spawned pid={} from \"{}\"\n", pid, path_str));
-            pid as i64
+    // Read the new ELF image.
+    let elf_data = match crate::fs::VFS.lock().read_all(path_str) {
+        Ok(d) => d,
+        Err(_) => {
+            crate::serial::_print(format_args!("[exec] cannot read \"{}\"\n", path_str));
+            return Errno::enoent.as_i64();
         }
-        Err(e) => {
-            crate::serial::_print(format_args!("[exec] failed to load \"{}\": {}\n", path_str, e));
-            Errno::enoent.as_i64()
+    };
+    if elf_data.is_empty() {
+        return Errno::enoent.as_i64();
+    }
+
+    // Load the ELF into a fresh address space (real image replacement:
+    // the new image occupies the SAME process/PID, not a new one).
+    let (addr_space, entry, _stack_top) =
+        match crate::userproc::load_elf_into_new_space(&elf_data) {
+            Ok(v) => v,
+            Err(e) => {
+                crate::serial::_print(format_args!(
+                    "[exec] failed to load \"{}\": {}\n",
+                    path_str, e
+                ));
+                return Errno::enoent.as_i64();
+            }
+        };
+    let new_cr3 = addr_space.pml4_frame.start_address().as_u64();
+
+    // Collect argv (up to 16 args, each ≤ 64 bytes, total ≤ 512 bytes)
+    // from the OLD user address space (still active at this point).
+    let mut argv_strs: [&[u8]; 16] = [b""; 16];
+    let mut argc: usize = 0;
+    let mut total_argv = 0usize;
+    if !argv.is_null() {
+        let mut i = 0usize;
+        while i < 16 {
+            let p = *argv.add(i);
+            if p == 0 {
+                break;
+            }
+            let mut l = 0usize;
+            while *(p as *const u8).add(l) != 0 && l < 64 {
+                l += 1;
+            }
+            if l == 0 {
+                break;
+            }
+            if total_argv + l + 1 > 512 {
+                break;
+            }
+            argv_strs[i] = core::slice::from_raw_parts(p as *const u8, l);
+            total_argv += l + 1;
+            argc += 1;
+            i += 1;
         }
     }
+
+    // Push argv/argc onto the NEW user stack (top page of the new space).
+    let stack_top_phys = match addr_space.translate(USER_STACK_TOP - 1) {
+        Some(p) => p,
+        None => return Errno::efault.as_i64(),
+    };
+    let phys_offset = *crate::memory::page_table::PHYSICAL_OFFSET.lock();
+    let stack_page_virt = phys_offset + stack_top_phys.as_u64();
+    let page_base_virt = USER_STACK_TOP - 4096;
+    let mut sp = stack_page_virt + 4096; // top of the stack page
+
+    let mut ptrs: [u64; 16] = [0; 16];
+    for i in (0..argc).rev() {
+        let arg = argv_strs[i];
+        sp -= (arg.len() + 1) as u64;
+        core::ptr::copy_nonoverlapping(arg.as_ptr(), sp as *mut u8, arg.len());
+        *(sp as *mut u8).add(arg.len()) = 0;
+        ptrs[i] = page_base_virt + (sp - stack_page_virt);
+    }
+    sp &= !7; // 8-byte align downward
+    for i in (0..argc).rev() {
+        sp -= 8;
+        *(sp as *mut u64) = ptrs[i];
+    }
+    sp -= 8;
+    *(sp as *mut u64) = 0; // argv[argc] = NULL
+    sp -= 8;
+    *(sp as *mut u64) = argc as u64; // argc
+    let new_user_rsp = page_base_virt + (sp - stack_page_virt);
+
+    crate::serial::_print(format_args!(
+        "[exec] pid={} image replaced: {} → entry={:#x}, rsp={:#x}, cr3={:#x}, argc={}\n",
+        crate::process::PROCESS_TABLE.lock().current_pid,
+        path_str,
+        entry,
+        new_user_rsp,
+        new_cr3,
+        argc
+    ));
+
+    // Free the OLD user address space (its frames are no longer reachable
+    // once we switch; kernel pages are shared and untouched).
+    {
+        let table = crate::process::PROCESS_TABLE.lock();
+        let pid = table.current_pid;
+        let old_cr3 = table.get(pid).map(|p| p.cr3).unwrap_or(0);
+        drop(table);
+        if old_cr3 != 0 && old_cr3 != new_cr3 {
+            if let Ok(frame) = x86_64::structures::paging::PhysFrame::<x86_64::structures::paging::Size4KiB>::from_start_address(
+                x86_64::PhysAddr::new(old_cr3),
+            ) {
+                crate::memory::page_table::AddressSpace { pml4_frame: frame }.dealloc_user();
+            }
+        }
+    }
+
+    // Update the process record and rebuild its kernel-stack context so
+    // that the next switch re-enters Ring3 at the new entry point.
+    {
+        let mut table = crate::process::PROCESS_TABLE.lock();
+        let pid = table.current_pid;
+        let name = path_str.rsplit('/').next().unwrap_or(path_str);
+        if let Some(proc) = table.get_mut(pid) {
+            proc.entry_point = entry;
+            proc.user_rsp = new_user_rsp;
+            proc.cr3 = new_cr3;
+            let mut nb = [0u8; 16];
+            let nlen = core::cmp::min(name.len(), 15);
+            nb[..nlen].copy_from_slice(&name.as_bytes()[..nlen]);
+            proc.name = nb;
+            proc.state = crate::process::ProcessState::Ready;
+        }
+        let slot = table
+            .processes
+            .iter()
+            .position(|p| p.pid == pid)
+            .unwrap_or(0);
+        drop(table);
+        crate::scheduler::init_process_stack(slot, crate::userproc::user_trampoline as *const () as u64);
+    }
+
+    // Switch into the new context (never returns).
+    crate::scheduler::restart_current();
+
+    // Unreachable in practice.
+    0
+}
+
+/// `getdents(path, buf, count)` — list a directory into a user buffer.
+///
+/// Each entry is 72 bytes: [0] type (1=file, 2=dir, 3=char, 4=block),
+/// [1..65] name (NUL-terminated), [65..72] zero. Returns bytes written
+/// (n * 72), or a negative errno.
+unsafe fn sys_getdents(path: *const u8, buf: *mut u8, count: u64) -> i64 {
+    let path_str = match read_path(path) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    if buf.is_null() {
+        return Errno::efault.as_i64();
+    }
+    let vfs = crate::fs::VFS.lock();
+    let entries = match vfs.readdir(&path_str) {
+        Ok(e) => e,
+        Err(_) => return -20, // ENOTDIR
+    };
+    let mut written: usize = 0;
+    for e in entries {
+        if written + 72 > count as usize {
+            break;
+        }
+        let ty = match e.file_type {
+            crate::fs::FileType::Regular => 1,
+            crate::fs::FileType::Directory => 2,
+            crate::fs::FileType::CharDevice => 3,
+            crate::fs::FileType::BlockDevice => 4,
+        };
+        *buf.add(written) = ty;
+        let name = e.name.as_bytes();
+        let n = core::cmp::min(name.len(), 63);
+        core::ptr::copy_nonoverlapping(name.as_ptr(), buf.add(written + 1), n);
+        *buf.add(written + 1 + n) = 0;
+        core::ptr::write_bytes(buf.add(written + 65), 0, 7);
+        written += 72;
+    }
+    written as i64
 }
 
 /// `getpid()` → current process ID.

@@ -191,10 +191,13 @@ impl ProcessTable {
         0
     }
 
-    /// Free a process slot (mark as Free).
+    /// Free a process slot (mark as Free). The process's user address
+    /// space (CR3) is deallocated first so its frames become reusable.
     pub fn free(&mut self, pid: u32) -> bool {
         for i in 0..MAX_PROCESSES {
             if self.processes[i].pid == pid {
+                dealloc_proc_space(self.processes[i].cr3);
+                self.processes[i].fd_table.clear();
                 self.processes[i] = Process::empty();
                 return true;
             }
@@ -239,10 +242,24 @@ impl ProcessTable {
     pub fn reap_zombies(&mut self) {
         for i in 0..MAX_PROCESSES {
             if self.processes[i].state == ProcessState::Zombie {
+                dealloc_proc_space(self.processes[i].cr3);
                 // Release FD table resources.
                 self.processes[i].fd_table.clear();
                 self.processes[i] = Process::empty();
             }
         }
+    }
+}
+
+/// Deallocate a process's user address space (frames below PML4 index 1).
+/// CR3 == 0 means the process shares the kernel space — nothing to free.
+fn dealloc_proc_space(cr3: u64) {
+    if cr3 == 0 {
+        return;
+    }
+    use x86_64::structures::paging::{PhysFrame, Size4KiB};
+    use x86_64::PhysAddr;
+    if let Ok(frame) = PhysFrame::<Size4KiB>::from_start_address(PhysAddr::new(cr3)) {
+        crate::memory::page_table::AddressSpace { pml4_frame: frame }.dealloc_user();
     }
 }

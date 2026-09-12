@@ -3,11 +3,13 @@ name = "sysutils"
 version = "0.1.0"
 edition = "2021"
 authors = ["flutter-os contributors"]
-description = "System debug utilities: ls, cat, ps, kill (Ring3, no_std)"
+description = "System debug utilities: ls, cat, ps, kill (Ring3, no_std, real int 0x80 syscalls)"
 license = "MIT"
 
 [dependencies]
 
+# No default features: built for the AeroOS Ring3 ABI (x86_64-unknown-none,
+# entry `_start`, loaded at 0x400000 via sysutils/linker.ld), compiled by the
+# top-level build.rs and packed into the disk image as /bin/sysutils.
 [features]
-default = ["skeleton"]
-skeleton = []
+default = []

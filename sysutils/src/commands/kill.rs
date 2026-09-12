@@ -39,8 +39,8 @@ pub fn run(arg: &[u8]) -> i32 {
 
     let result = syscalls::kill(pid, signum);
     if result < 0 {
-        syscalls::print("kill: failed to signal pid ");
-        syscalls::print(core::str::from_utf8(arg).unwrap_or("?"));
+        syscalls::print_str("kill: failed to signal pid ");
+        syscalls::print_str(core::str::from_utf8(arg).unwrap_or("?"));
         syscalls::println("");
         return 1;
     }

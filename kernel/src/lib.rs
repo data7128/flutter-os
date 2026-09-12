@@ -244,16 +244,16 @@ pub fn kernel_main(boot_info: &'static mut bootloader_api::BootInfo) -> ! {
                 println!("[boot] FAILED to spawn /disk/hello: {}", e);
             }
         }
-        // Second process: fork test. Running two processes concurrently
-        // exercises the round-robin scheduler; the program then forks.
-        println!("[boot] spawning /disk/forktest from FAT32 disk...");
-        match userproc::spawn_user_process_from_path("/disk/forktest") {
+        // Second process: sysutils (Ring3 tools; with no argv it runs
+        // the self-check demo: ls /, then fork+exec /bin/hello+waitpid).
+        println!("[boot] spawning /disk/sysutils from FAT32 disk...");
+        match userproc::spawn_user_process_from_path("/disk/sysutils") {
             Ok(pid) => {
-                println!("[boot] /disk/forktest spawned as pid={} (from disk)", pid);
+                println!("[boot] /disk/sysutils spawned as pid={} (from disk)", pid);
                 launched = true;
             }
             Err(e) => {
-                println!("[boot] FAILED to spawn /disk/forktest: {}", e);
+                println!("[boot] FAILED to spawn /disk/sysutils: {}", e);
             }
         }
     }
@@ -268,6 +268,16 @@ pub fn kernel_main(boot_info: &'static mut bootloader_api::BootInfo) -> ! {
             }
             Err(e) => {
                 println!("[boot] FAILED to spawn /bin/hello: {}", e);
+            }
+        }
+        println!("[boot] spawning /bin/sysutils from tmpfs initramfs...");
+        match userproc::spawn_user_process_from_path("/bin/sysutils") {
+            Ok(pid) => {
+                println!("[boot] /bin/sysutils spawned as pid={}", pid);
+                launched = true;
+            }
+            Err(e) => {
+                println!("[boot] FAILED to spawn /bin/sysutils: {}", e);
             }
         }
     }

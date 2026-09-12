@@ -19,6 +19,9 @@ const FAT32_FAT_SZ: u32 = 126;
 /// First data cluster LBA (relative to partition start).
 const FAT32_DATA_START: u32 = 32 + 2 * 126; // = 284
 
+/// FAT32 data cluster where the sysutils ELF chain starts.
+const SYSUTILS_START_CLUSTER: usize = 5;
+
 /// The minimal ELF64 user program written to the FAT32 root directory.
 /// MUST stay in sync with `kernel/src/fs/initramfs.rs::HELLO_ELF`.
 const HELLO_ELF: &[u8] = &[
@@ -89,6 +92,16 @@ const FORKTEST_ELF: &[u8] = &[
     0x64, 0x0a, 0x70, 0x61, 0x72, 0x65, 0x6e, 0x74, 0x0a,
 ];
 
+/// Precompiled sysutils ELF (user/sysutils.elf, from the sysutils crate).
+/// MUST stay in sync with `kernel/src/fs/initramfs.rs::SYSUTILS_ELF`.
+const SYSUTILS_ELF: &[u8] = include_bytes!("user/sysutils.elf");
+
+/// A short README placed on the FAT32 disk.
+const README_TEXT: &[u8] = b"AeroOS - a hobby x86_64 kernel in Rust.\n\
+Features: serial/VGA console, PS/2 input, ATA PIO disk, FAT32, ELF loader,\n\
+preemptive scheduler, fork/exec/waitpid, signals, and sysutils user-space\n\
+tools (ls/cat/ps/kill).\n";
+
 /// Build a 512-byte FAT32 boot sector (BPB) for the partition.
 fn make_bpb() -> [u8; 512] {
     let mut bpb = [0u8; 512];
@@ -140,6 +153,24 @@ fn make_fat() -> Vec<u8> {
     set(&mut fat, 2, 0x0FFF_FFFF); // root directory: EOC
     set(&mut fat, 3, 0x0FFF_FFFF); // hello file: EOC
     set(&mut fat, 4, 0x0FFF_FFFF); // forktest file: EOC
+
+    // SYSUTILS file: cluster chain starting at SYSUTILS_START_CLUSTER.
+    // sysutils.elf is ~16 KiB, so it spans multiple 512-byte clusters.
+    let sysutils_clusters = SYSUTILS_ELF.len().div_ceil(512);
+    for i in 0..sysutils_clusters {
+        let c = SYSUTILS_START_CLUSTER + i;
+        let next = if i + 1 == sysutils_clusters {
+            0x0FFF_FFFF
+        } else {
+            (SYSUTILS_START_CLUSTER + i + 1) as u32
+        };
+        set(&mut fat, c, next);
+    }
+
+    // README file: single cluster after the sysutils chain.
+    let readme_cluster = SYSUTILS_START_CLUSTER + sysutils_clusters;
+    set(&mut fat, readme_cluster, 0x0FFF_FFFF);
+
     let _ = total_entries;
     fat
 }
@@ -183,7 +214,44 @@ fn make_root_cluster() -> Vec<u8> {
     cluster[f + 26..f + 28].copy_from_slice(&4u16.to_le_bytes()); // FstClusLO
     cluster[f + 28..f + 32]
         .copy_from_slice(&(FORKTEST_ELF.len() as u32).to_le_bytes()); // FileSize
+
+    // SYSUTILS file entry (slot 3). First cluster index may exceed
+    // 16 bits only if the chain starts above 65535 — it doesn't here,
+    // so FstClusHI stays 0.
+    let g = 96usize;
+    cluster[g..g + 11].copy_from_slice(b"SYSUTILS   ");
+    cluster[g + 11] = 0x20; // ATTR_ARCHIVE
+    cluster[g + 13] = 0x10;
+    cluster[g + 14..g + 16].copy_from_slice(&0x8A17u16.to_le_bytes());
+    cluster[g + 16..g + 18].copy_from_slice(&0x4A4Bu16.to_le_bytes());
+    cluster[g + 18..g + 20].copy_from_slice(&0x4A4Bu16.to_le_bytes());
+    cluster[g + 22..g + 24].copy_from_slice(&0x8A17u16.to_le_bytes());
+    cluster[g + 24..g + 26].copy_from_slice(&0x4A4Bu16.to_le_bytes());
+    cluster[g + 26..g + 28]
+        .copy_from_slice(&(SYSUTILS_START_CLUSTER as u16).to_le_bytes()); // FstClusLO
+    cluster[g + 28..g + 32]
+        .copy_from_slice(&(SYSUTILS_ELF.len() as u32).to_le_bytes()); // FileSize
+
+    // README file entry (slot 4).
+    let h = 128usize;
+    cluster[h..h + 11].copy_from_slice(b"README     ");
+    cluster[h + 11] = 0x20; // ATTR_ARCHIVE
+    cluster[h + 13] = 0x10;
+    cluster[h + 14..h + 16].copy_from_slice(&0x8A17u16.to_le_bytes());
+    cluster[h + 16..h + 18].copy_from_slice(&0x4A4Bu16.to_le_bytes());
+    cluster[h + 18..h + 20].copy_from_slice(&0x4A4Bu16.to_le_bytes());
+    cluster[h + 22..h + 24].copy_from_slice(&0x8A17u16.to_le_bytes());
+    cluster[h + 24..h + 26].copy_from_slice(&0x4A4Bu16.to_le_bytes());
+    cluster[h + 26..h + 28]
+        .copy_from_slice(&(SYSUTILS_START_CLUSTER as u16 + sysutils_clusters() as u16).to_le_bytes()); // FstClusLO
+    cluster[h + 28..h + 32]
+        .copy_from_slice(&(README_TEXT.len() as u32).to_le_bytes()); // FileSize
     cluster
+}
+
+/// Number of clusters the sysutils ELF occupies (512 B each).
+fn sysutils_clusters() -> usize {
+    SYSUTILS_ELF.len().div_ceil(512)
 }
 
 /// Build the whole FAT32 partition image (as a sector stream).
@@ -213,6 +281,24 @@ fn make_fat32_partition() -> Vec<u8> {
     let mut forktest_cluster = vec![0u8; 512];
     forktest_cluster[..FORKTEST_ELF.len()].copy_from_slice(FORKTEST_ELF);
     root.extend_from_slice(&forktest_cluster);
+
+    // Write SYSUTILS_ELF into its cluster chain starting at
+    // SYSUTILS_START_CLUSTER.
+    let sysutils_clusters = SYSUTILS_ELF.len().div_ceil(512);
+    let mut remaining = SYSUTILS_ELF;
+    for _ in 0..sysutils_clusters {
+        let mut c = vec![0u8; 512];
+        let take = remaining.len().min(512);
+        c[..take].copy_from_slice(&remaining[..take]);
+        root.extend_from_slice(&c);
+        remaining = &remaining[take..];
+    }
+
+    // Write README into its cluster.
+    let mut readme_cluster = vec![0u8; 512];
+    readme_cluster[..README_TEXT.len()].copy_from_slice(README_TEXT);
+    root.extend_from_slice(&readme_cluster);
+
     img.extend_from_slice(&root);
     // Fill the remaining data sectors with zeros.
     let data_sectors = FAT32_SECTORS as usize - FAT32_DATA_START as usize;
