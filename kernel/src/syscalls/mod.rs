@@ -113,6 +113,10 @@ pub enum SyscallNum {
     /// arg0 = path pointer, arg1 = user buffer, arg2 = buffer size.
     /// Returns bytes written (n * 72) or a negative errno.
     Getdents = 23,
+    /// `getprocs(buf, count)` — fill up to `count` ProcInfo entries
+    /// (40 bytes each: pid u64, ppid u64, state u64, name[16]) from the
+    /// process table. Returns the number of entries written.
+    Getprocs = 24,
 }
 
 impl SyscallNum {
@@ -140,6 +144,8 @@ impl SyscallNum {
             20 => Some(Self::Fork),
             21 => Some(Self::Waitpid),
             22 => Some(Self::Getppid),
+            23 => Some(Self::Getdents),
+            24 => Some(Self::Getprocs),
             _ => None,
         }
     }
@@ -253,6 +259,7 @@ pub fn dispatch(
             Some(SyscallNum::Exit) => sys_exit(arg0 as i32),
             Some(SyscallNum::Exec) => sys_exec(arg0 as *const u8, arg1 as *const u64),
             Some(SyscallNum::Getdents) => sys_getdents(arg0 as *const u8, arg1 as *mut u8, arg2 as u64),
+            Some(SyscallNum::Getprocs) => sys_getprocs(arg0 as *mut u8, arg1),
             Some(SyscallNum::Getpid) => sys_getpid(),
             Some(SyscallNum::Close) => sys_close(arg0 as i32),
             Some(SyscallNum::Mkdir) => sys_mkdir(arg0 as *const u8),
@@ -847,6 +854,38 @@ unsafe fn sys_getdents(path: *const u8, buf: *mut u8, count: u64) -> i64 {
         *buf.add(written + 1 + n) = 0;
         core::ptr::write_bytes(buf.add(written + 65), 0, 7);
         written += 72;
+    }
+    written as i64
+}
+
+/// `getprocs(buf, count)` — snapshot the process table into a user
+/// buffer. Entry layout (40 bytes):
+///   [0..8)  pid
+///   [8..16) parent pid
+///   [16..24) state (1 Ready, 2 Running, 3 Blocked, 4 Zombie)
+///   [24..40) name (16 bytes, zero-padded)
+/// Returns the number of entries written, or a negative errno.
+unsafe fn sys_getprocs(buf: *mut u8, count: u64) -> i64 {
+    if buf.is_null() {
+        return Errno::efault.as_i64();
+    }
+    let procs = crate::process::PROCESS_TABLE.lock();
+    let mut written: usize = 0;
+    for p in procs.processes.iter() {
+        if p.pid == 0 {
+            continue;
+        }
+        if written >= count as usize {
+            break;
+        }
+        let base = unsafe { buf.add(written * 40) };
+        unsafe {
+            core::ptr::write_unaligned(base as *mut u64, p.pid as u64);
+            core::ptr::write_unaligned(base.add(8) as *mut u64, p.parent_pid as u64);
+            core::ptr::write_unaligned(base.add(16) as *mut u64, p.state as u64);
+            core::ptr::copy_nonoverlapping(p.name.as_ptr(), base.add(24), 16);
+        }
+        written += 1;
     }
     written as i64
 }

@@ -126,14 +126,13 @@ fn demo() -> i32 {
         syscalls::exit(1);
     } else if r > 0 {
         let mut status: i32 = 0;
-        let w = syscalls::waitpid(r, &mut status);
-        syscalls::print_str("--- child ");
-        syscalls::print_u64(r as u64);
-        syscalls::print_str(" reaped, waitpid=");
-        syscalls::print_i64(w);
-        syscalls::print_str(", status=");
+        let _w = syscalls::waitpid(r, &mut status);
+        syscalls::print_str("--- child exited, status=");
         syscalls::print_i64(status as i64);
         syscalls::println(" ---");
+
+        syscalls::println("--- ps ---");
+        commands::ps::run();
         0
     } else {
         syscalls::print_str("fork failed: ");

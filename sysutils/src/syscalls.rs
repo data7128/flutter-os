@@ -25,6 +25,7 @@ pub const SYS_STAT: u64 = 17;
 pub const SYS_FORK: u64 = 20;
 pub const SYS_WAITPID: u64 = 21;
 pub const SYS_GETDENTS: u64 = 23;
+pub const SYS_GETPROCS: u64 = 24;
 
 /// `stat` result, layout matches the kernel's `StatBuf`.
 #[repr(C)]
@@ -114,6 +115,22 @@ pub fn getdents(path: &[u8], buf: *mut u8, count: usize) -> i64 {
         return -28;
     };
     unsafe { syscall3(SYS_GETDENTS, p.as_ptr() as u64, buf as u64, count as u64) }
+}
+
+/// A single process-table entry as returned by `getprocs` (40 bytes).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ProcInfo {
+    pub pid: u64,
+    pub ppid: u64,
+    pub state: u64,
+    pub name: [u8; 16],
+}
+
+/// Snapshot the process table: `getprocs(buf, count)` returns the number
+/// of entries written into `buf` or a negative errno.
+pub fn getprocs(buf: *mut ProcInfo, count: usize) -> i64 {
+    unsafe { syscall3(SYS_GETPROCS, buf as u64, count as u64, 0) }
 }
 
 /// stat a path.
