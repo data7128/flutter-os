@@ -32,7 +32,7 @@ global_asm!(
     r#"
 .global switch_context
 switch_context:
-    // rdi = &mut old_rsp, rsi = new_rsp
+    // rdi = &mut old_rsp, rsi = new_rsp, rdx = new_cr3 (0 = don't switch)
     // Save callee-saved registers on the current (old) kernel stack.
     push rbp
     push rbx
@@ -47,6 +47,16 @@ switch_context:
     // Switch to new stack.
     mov rsp, rsi
 
+    // Switch address space AFTER the stack switch: the new stack is a
+    // per-process kernel stack in the higher-half (PML4 index 4+), which
+    // every user PML4 shares, so the new CR3 is always valid here.
+    // Switching CR3 before the stack switch would strand the old
+    // (bootloader, low-region) stack — unmapped in the user PML4.
+    mov rax, rdx
+    test rax, rax
+    jz 1f
+    mov cr3, rax
+1:
     // Restore callee-saved registers from the new stack.
     pop r15
     pop r14
@@ -63,11 +73,15 @@ switch_context:
 extern "C" {
     /// Switch from the current kernel stack to `new_rsp`.
     ///
+    /// `new_cr3` is written to CR3 right after the stack switch (0 = leave
+    /// CR3 unchanged).
+    ///
     /// # Safety
     /// `old_rsp` must point to a valid `u64` that receives the old RSP.
     /// `new_rsp` must point to a valid kernel stack with a saved context
     /// (callee-saved registers + return address) laid out by `switch_context`.
-    fn switch_context(old_rsp: *mut u64, new_rsp: u64);
+    /// `new_cr3` must be the physical address of a valid PML4.
+    fn switch_context(old_rsp: *mut u64, new_rsp: u64, new_cr3: u64);
 }
 
 // ── Per-process kernel stack ────────────────────────────────────────────
@@ -173,19 +187,70 @@ fn find_slot(pid: u32) -> Option<usize> {
 }
 
 /// Called on every timer tick. Decrements the current time slice and
-/// triggers a reschedule when it reaches zero.
+/// triggers a reschedule when it reaches zero — or when the current
+/// process has become a zombie (e.g. a signal killed it since the last
+/// tick), so it can't keep the CPU after death.
+///
+/// # Lock safety
+/// The timer interrupt may fire while the main line of execution holds
+/// `PROCESS_TABLE` (syscalls, scheduler). Blocking on that lock inside
+/// the interrupt handler would deadlock, so the zombie/signal check uses
+/// `try_lock` — if the table is busy we simply skip delivery this tick
+/// and try again on the next one.
 pub fn on_timer_tick() {
-    let mut sched = SCHEDULER.lock();
-    if !sched.active {
+    let need_resched = {
+        let mut sched = SCHEDULER.lock();
+        if !sched.active {
+            return;
+        }
+        if sched.current_slice > 0 {
+            sched.current_slice -= 1;
+        }
+        sched.current_slice == 0
+    };
+    if need_resched {
+        schedule();
         return;
     }
-    if sched.current_slice > 0 {
-        sched.current_slice -= 1;
-    }
-    if sched.current_slice == 0 {
-        drop(sched);
+
+    // Try to deliver pending signals / detect a zombie current process.
+    // Non-blocking: if the table is locked by the main line, skip.
+    let current_is_zombie = {
+        let mut table = match PROCESS_TABLE.try_lock() {
+            Some(t) => t,
+            None => return,
+        };
+        let cur = table.current_pid;
+        if cur == 0 {
+            false
+        } else {
+            crate::signal::deliver_pending_into(&mut table);
+            table.get(cur).map_or(false, |p| p.state == ProcessState::Zombie)
+        }
+    };
+    if current_is_zombie {
         schedule();
     }
+}
+
+/// Find the next runnable (Ready) process, scanning forward from
+/// `after_pid`'s slot with wraparound. Returns None if nothing is runnable.
+fn find_next_ready(after_pid: u32) -> Option<u32> {
+    let table = PROCESS_TABLE.lock();
+    let current_slot = table
+        .processes
+        .iter()
+        .position(|p| p.pid == after_pid)
+        .unwrap_or(0);
+
+    for i in 1..=32 {
+        let idx = (current_slot + i) % 32;
+        let p = &table.processes[idx];
+        if p.pid != 0 && p.state == ProcessState::Ready {
+            return Some(p.pid);
+        }
+    }
+    None
 }
 
 /// Pick the next runnable process and switch to it.
@@ -193,27 +258,8 @@ pub fn on_timer_tick() {
 /// Round-robin: scan from the current PID forward, wrap around, and
 /// pick the first process in `Ready` state.
 pub fn schedule() {
-    let (current_pid, next_pid) = {
-        let table = PROCESS_TABLE.lock();
-        let current = table.current_pid;
-        let current_slot = table
-            .processes
-            .iter()
-            .position(|p| p.pid == current)
-            .unwrap_or(0);
-
-        // Scan forward from current slot, wrap around.
-        let mut next: Option<u32> = None;
-        for i in 1..=32 {
-            let idx = (current_slot + i) % 32;
-            let p = &table.processes[idx];
-            if p.pid != 0 && p.state == ProcessState::Ready {
-                next = Some(p.pid);
-                break;
-            }
-        }
-        (current, next)
-    };
+    let current_pid = PROCESS_TABLE.lock().current_pid;
+    let next_pid = find_next_ready(current_pid);
 
     let next_pid = match next_pid {
         Some(pid) => pid,
@@ -221,13 +267,41 @@ pub fn schedule() {
     };
 
     if next_pid == current_pid {
-        // Reset slice and continue.
-        SCHEDULER.lock().current_slice = SCHEDULER.lock().default_slice;
+        // Reset slice and continue. (Single lock acquisition — spin
+        // locks are not re-entrant.)
+        let mut sched = SCHEDULER.lock();
+        sched.current_slice = sched.default_slice;
         return;
     }
 
     // Perform the context switch.
     do_context_switch(current_pid, next_pid);
+}
+
+/// Switch away from the current process (which has just exited or been
+/// killed) to the next runnable one. If nothing else is runnable, this
+/// returns and the caller should idle until the next timer tick.
+pub fn switch_to_next() {
+    let current = PROCESS_TABLE.lock().current_pid;
+    let next = find_next_ready(current);
+    if let Some(next_pid) = next {
+        if next_pid != current {
+            do_context_switch(current, next_pid);
+            // If we ever return here the "old" process was resurrected,
+            // which shouldn't happen for a zombie; just fall through.
+        }
+    }
+}
+
+/// Voluntarily give up the CPU: reschedule to the next ready process
+/// right away. Used by blocking syscalls (e.g. `waitpid`) — a bare
+/// `hlt` would NOT switch, because the scheduler only reschedules when
+/// the time slice expires or the current process dies.
+pub fn yield_now() {
+    let current = PROCESS_TABLE.lock().current_pid;
+    if current != 0 {
+        schedule();
+    }
 }
 
 /// Perform a context switch from `old_pid` to `new_pid`.
@@ -302,14 +376,23 @@ fn do_context_switch(old_pid: u32, new_pid: u32) {
         set_tss_rsp0(stacks[new_slot].stack_top());
     }
 
+    // Read the new process's CR3 (physical PML4 address). The actual
+    // write happens in the switch_context asm AFTER the stack switch —
+    // switching CR3 while still on the old (bootloader, low-region)
+    // stack would fault, because user PML4s only map the higher half.
+    let new_cr3 = {
+        let table = PROCESS_TABLE.lock();
+        table.get(new_pid).map_or(0, |p| p.cr3)
+    };
+
     // Drop the stacks lock before the actual switch: the spin lock would
     // otherwise stay held across the whole time slice and deadlock the
     // next timer tick (which also takes KERNEL_STACKS).
     drop(stacks);
 
-    // Perform the actual register/stack switch.
+    // Perform the actual register/stack/CR3 switch.
     unsafe {
-        switch_context(old_rsp_ptr, new_rsp);
+        switch_context(old_rsp_ptr, new_rsp, new_cr3);
     }
 }
 

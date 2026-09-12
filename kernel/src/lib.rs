@@ -207,15 +207,18 @@ pub fn kernel_main(boot_info: &'static mut bootloader_api::BootInfo) -> ! {
     // Resource access checks for framebuffer, input, filesystem.
     println!("[OK] PERMISSION_SUBSYS");
 
-    // ── 18. Future subsystems (not yet implemented) ───────────────
-    // Ring 3 usermode requires TSS user segments + syscall/iretq handling.
-    println!("[PENDING] USERMODE");
-    // Scheduler requires context switching (task structs, context save/restore).
-    println!("[PENDING] SCHEDULER");
-    // Signals (kill, sigaction) require per-process signal mask + delivery.
-    println!("[PENDING] SIGNAL");
-    // fork/exec require process address space duplication + ELF loader.
-    println!("[PENDING] FORK_EXEC");
+    // ── 18. Process subsystem ────────────────────────────────────
+    // Ring3 usermode is live: ELF processes run in Ring3 with per-process
+    // address spaces and preemptive round-robin scheduling.
+    println!("[OK] USERMODE");
+    println!("[OK] SCHEDULER");
+    // Signals: kill(pid, sig) delivers pending signals on the timer
+    // tick; SIGKILL/SIGTERM terminate, other signals are pending.
+    println!("[OK] SIGNAL");
+    // fork() duplicates the process (address space + fd table); exec
+    // loads ELF binaries from the VFS. Process exit is reaped by the
+    // scheduler.
+    println!("[OK] FORK_EXEC");
 
     println!("[boot] AeroOS ready — all subsystems online.\n");
 
@@ -239,6 +242,18 @@ pub fn kernel_main(boot_info: &'static mut bootloader_api::BootInfo) -> ! {
             }
             Err(e) => {
                 println!("[boot] FAILED to spawn /disk/hello: {}", e);
+            }
+        }
+        // Second process: fork test. Running two processes concurrently
+        // exercises the round-robin scheduler; the program then forks.
+        println!("[boot] spawning /disk/forktest from FAT32 disk...");
+        match userproc::spawn_user_process_from_path("/disk/forktest") {
+            Ok(pid) => {
+                println!("[boot] /disk/forktest spawned as pid={} (from disk)", pid);
+                launched = true;
+            }
+            Err(e) => {
+                println!("[boot] FAILED to spawn /disk/forktest: {}", e);
             }
         }
     }

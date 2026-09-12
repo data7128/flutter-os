@@ -30,6 +30,7 @@ pub mod fd;
 pub mod input;
 pub mod time;
 
+pub use fd::FdKind;
 pub use fd::FdTable;
 use alloc::borrow::ToOwned;
 
@@ -99,6 +100,14 @@ pub enum SyscallNum {
     Chdir = 18,
     /// `getcwd(buf, size)` — get current working directory.
     Getcwd = 19,
+    /// `fork()` — duplicate the calling process. Returns 0 in the child,
+    /// the child's PID in the parent.
+    Fork = 20,
+    /// `waitpid(pid, status_ptr)` — wait for a child to exit and reap it.
+    /// pid=-1 waits for any child. Returns the child PID.
+    Waitpid = 21,
+    /// `getppid()` — return the parent process ID.
+    Getppid = 22,
 }
 
 impl SyscallNum {
@@ -123,6 +132,9 @@ impl SyscallNum {
             17 => Some(Self::Stat),
             18 => Some(Self::Chdir),
             19 => Some(Self::Getcwd),
+            20 => Some(Self::Fork),
+            21 => Some(Self::Waitpid),
+            22 => Some(Self::Getppid),
             _ => None,
         }
     }
@@ -149,6 +161,23 @@ pub fn init() {
 
 /// EPERM error code (operation not permitted).
 const EPERM: i64 = -1;
+
+/// Access the calling process's file descriptor table.
+///
+/// Every process owns its own `FdTable` (inherited by children at fork).
+/// When the kernel itself issues a syscall (current_pid == 0), fall back
+/// to the legacy global table.
+fn with_fd_table_mut<T>(f: impl FnOnce(&mut FdTable) -> T) -> T {
+    let pid = crate::process::PROCESS_TABLE.lock().current_pid;
+    if pid != 0 {
+        let mut table = crate::process::PROCESS_TABLE.lock();
+        if let Some(proc) = table.get_mut(pid) {
+            return f(&mut proc.fd_table);
+        }
+    }
+    let mut global = FD_TABLE.lock();
+    f(&mut global)
+}
 
 /// Check if the current process has permission for a resource.
 /// Returns `true` if access is granted, `false` if denied.
@@ -182,6 +211,7 @@ pub fn dispatch(
     arg3: u64,
     _arg4: u64,
     _arg5: u64,
+    ctx: *mut crate::syscall_trampoline::InterruptContext,
 ) -> i64 {
     // Pre-dispatch permission checks for sensitive syscalls.
     // In Ring 0 mode (current_pid=0) all checks pass; in Ring 3
@@ -224,6 +254,9 @@ pub fn dispatch(
             Some(SyscallNum::Stat) => sys_stat(arg0 as *const u8, arg1 as *mut StatBuf),
             Some(SyscallNum::Chdir) => sys_chdir(arg0 as *const u8),
             Some(SyscallNum::Getcwd) => sys_getcwd(arg0 as *mut u8, arg1),
+            Some(SyscallNum::Fork) => sys_fork(ctx),
+            Some(SyscallNum::Waitpid) => sys_waitpid(arg0, arg1),
+            Some(SyscallNum::Getppid) => sys_getppid(),
             None => Errno::enosys.as_i64(),
         }
     }
@@ -252,20 +285,24 @@ unsafe fn sys_open(path: *const u8, flags: u32) -> i64 {
     };
 
     let create = (flags & 0x40) != 0; // O_CREAT
-    let vfs = crate::fs::VFS.lock();
-    let file = match vfs.open(path_str, create) {
-        Ok(f) => f,
-        Err(e) => {
-            crate::serial::_print(format_args!("[syscall] open(\"{}\") failed: {}\n", path_str, e));
-            return Errno::enoent.as_i64();
-        }
+    let (mount_idx, inode_id) = {
+        let vfs = crate::fs::VFS.lock();
+        let file = match vfs.open(path_str, create) {
+            Ok(f) => f,
+            Err(e) => {
+                crate::serial::_print(format_args!("[syscall] open(\"{}\") failed: {}\n", path_str, e));
+                return Errno::enoent.as_i64();
+            }
+        };
+        (file.mount_idx, file.inode_id)
     };
 
-    let mut table = FD_TABLE.lock();
-    let fd = table.alloc(crate::syscalls::fd::FdKind::VfsFile {
-        mount_idx: file.mount_idx,
-        inode_id: file.inode_id,
-        offset: 0,
+    let fd = with_fd_table_mut(|table| {
+        table.alloc(crate::syscalls::fd::FdKind::VfsFile {
+            mount_idx,
+            inode_id,
+            offset: 0,
+        })
     });
     match fd {
         Some(f) => f as i64,
@@ -298,27 +335,28 @@ unsafe fn sys_read(fd: i32, buf: *mut u8, count: u64) -> i64 {
             read as i64
         }
         _ => {
-            // Check FD table for file-backed descriptors
-            let mut table = FD_TABLE.lock();
-            match table.get(fd as usize) {
-                Some(entry) => {
-                    if let crate::syscalls::fd::FdKind::VfsFile { mount_idx, inode_id, offset } = entry.kind {
-                        // Read from VFS file.
-                        let vfs = crate::fs::VFS.lock();
-                        let mut vfs_file = crate::fs::VfsFile {
-                            inode_id, mount_idx, offset, file_type: crate::fs::FileType::Regular,
-                        };
-                        let n = vfs.read(&mut vfs_file, core::slice::from_raw_parts_mut(buf, count as usize));
-                        // Update offset in FD table.
-                        table.update_vfs_offset(fd as usize, vfs_file.offset);
-                        match n {
-                            Ok(bytes) => bytes as i64,
-                            Err(_) => Errno::einval.as_i64(),
-                        }
-                    } else {
-                        // Legacy File kind — not yet implemented.
-                        Errno::enosys.as_i64()
+            // Check the process FD table for file-backed descriptors.
+            let kind = with_fd_table_mut(|table| table.get(fd as usize).map(|e| e.kind));
+            match kind {
+                Some(FdKind::VfsFile { mount_idx, inode_id, offset }) => {
+                    // Read from VFS file.
+                    let vfs = crate::fs::VFS.lock();
+                    let mut vfs_file = crate::fs::VfsFile {
+                        inode_id, mount_idx, offset, file_type: crate::fs::FileType::Regular,
+                    };
+                    let n = vfs.read(&mut vfs_file, core::slice::from_raw_parts_mut(buf, count as usize));
+                    let new_offset = vfs_file.offset;
+                    drop(vfs);
+                    // Update offset in the process FD table.
+                    with_fd_table_mut(|t| t.update_vfs_offset(fd as usize, new_offset));
+                    match n {
+                        Ok(bytes) => bytes as i64,
+                        Err(_) => Errno::einval.as_i64(),
                     }
+                }
+                Some(_) => {
+                    // Legacy File kind — not yet implemented.
+                    Errno::enosys.as_i64()
                 }
                 None => Errno::ebadf.as_i64(),
             }
@@ -360,25 +398,24 @@ unsafe fn sys_write(fd: i32, buf: *const u8, count: u64) -> i64 {
             count as i64
         }
         _ => {
-            // VFS file write.
-            let mut table = FD_TABLE.lock();
-            match table.get(fd as usize) {
-                Some(entry) => {
-                    if let crate::syscalls::fd::FdKind::VfsFile { mount_idx, inode_id, offset } = entry.kind {
-                        let vfs = crate::fs::VFS.lock();
-                        let mut vfs_file = crate::fs::VfsFile {
-                            inode_id, mount_idx, offset, file_type: crate::fs::FileType::Regular,
-                        };
-                        let n = vfs.write(&mut vfs_file, slice);
-                        table.update_vfs_offset(fd as usize, vfs_file.offset);
-                        match n {
-                            Ok(bytes) => bytes as i64,
-                            Err(_) => Errno::einval.as_i64(),
-                        }
-                    } else {
-                        Errno::ebadf.as_i64()
+            // VFS file write through the process FD table.
+            let kind = with_fd_table_mut(|table| table.get(fd as usize).map(|e| e.kind));
+            match kind {
+                Some(FdKind::VfsFile { mount_idx, inode_id, offset }) => {
+                    let vfs = crate::fs::VFS.lock();
+                    let mut vfs_file = crate::fs::VfsFile {
+                        inode_id, mount_idx, offset, file_type: crate::fs::FileType::Regular,
+                    };
+                    let n = vfs.write(&mut vfs_file, slice);
+                    let new_offset = vfs_file.offset;
+                    drop(vfs);
+                    with_fd_table_mut(|t| t.update_vfs_offset(fd as usize, new_offset));
+                    match n {
+                        Ok(bytes) => bytes as i64,
+                        Err(_) => Errno::einval.as_i64(),
                     }
                 }
+                Some(_) => Errno::ebadf.as_i64(),
                 None => Errno::ebadf.as_i64(),
             }
         }
@@ -576,14 +613,11 @@ unsafe fn sys_kill(pid: u32, signum: u8) -> i64 {
 
 /// `exit(status)` → never returns (marks process as zombie).
 ///
-/// Releases all process resources:
-/// - File descriptors (non-std FDs closed)
-/// - Pending signals cleared
-/// - Process state set to Zombie
-///
-/// [MANUAL] In Ring3, this performs an `iretq` back to the kernel
-/// scheduler. For now, it just marks the process and halts.
-unsafe fn sys_exit(status: i32) -> i64 {
+/// Marks the calling process as a zombie, then hands control to the
+/// scheduler so the next runnable process is switched in. If no other
+/// process is runnable the kernel idles (the timer interrupt will
+/// reschedule later).
+unsafe fn sys_exit(status: i32) -> ! {
     let current = crate::process::PROCESS_TABLE.lock().current_pid;
     crate::serial::_print(format_args!(
         "[syscall] exit({}) from pid={}\n", status, current
@@ -592,8 +626,8 @@ unsafe fn sys_exit(status: i32) -> i64 {
     // Release resources and mark as zombie.
     crate::process::PROCESS_TABLE.lock().mark_exit(current, status);
 
-    // [MANUAL] In Ring3: switch to next runnable process here.
-    // For now, halt — kernel has no scheduler yet.
+    // Switch to the next runnable process (never returns if one exists).
+    crate::scheduler::switch_to_next();
     crate::hlt_loop();
 }
 
@@ -652,8 +686,7 @@ unsafe fn sys_close(fd: i32) -> i64 {
         // Don't allow closing stdin/stdout/stderr.
         return Errno::ebadf.as_i64();
     }
-    let mut table = FD_TABLE.lock();
-    if table.close(fd as usize) {
+    if with_fd_table_mut(|table| table.close(fd as usize)) {
         0
     } else {
         Errno::ebadf.as_i64()
@@ -801,6 +834,202 @@ unsafe fn sys_getcwd(buf: *mut u8, size: u64) -> i64 {
     core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, bytes.len());
     *buf.add(bytes.len()) = 0;
     0
+}
+
+/// `fork()` → 0 in the child, the child's PID in the parent, negative
+/// errno on failure.
+///
+/// Duplicates the calling process:
+/// - a fresh user address space with identical page contents (copy of
+///   the parent's user pages; copy-on-write is a future optimisation)
+/// - a copy of the parent's file descriptor table
+/// - a kernel stack that resumes the child right after its `int 0x80`
+///   with `rax = 0`, so user code can branch on the fork return value.
+unsafe fn sys_fork(ctx: *mut crate::syscall_trampoline::InterruptContext) -> i64 {
+    let parent_pid = crate::process::PROCESS_TABLE.lock().current_pid;
+    if parent_pid == 0 {
+        // The kernel itself cannot fork.
+        return Errno::enosys.as_i64();
+    }
+    if ctx.is_null() {
+        return Errno::einval.as_i64();
+    }
+    let ctx = &*ctx;
+
+    // 1. Clone the parent's user address space.
+    let parent_cr3 = {
+        let table = crate::process::PROCESS_TABLE.lock();
+        match table.get(parent_pid) {
+            Some(p) if p.cr3 != 0 => p.cr3,
+            _ => return Errno::enosys.as_i64(),
+        }
+    };
+    let parent_as = match crate::memory::page_table::AddressSpace::from_cr3(parent_cr3) {
+        Some(a) => a,
+        None => return Errno::enosys.as_i64(),
+    };
+    let child_as = match parent_as.clone_user_space() {
+        Ok(a) => a,
+        Err(_) => return Errno::enomem.as_i64(),
+    };
+    let child_cr3 = child_as.pml4_frame.start_address().as_u64();
+
+    // 2. Allocate the child slot and copy parent fields.
+    let (child_pid, child_slot) = {
+        let mut table = crate::process::PROCESS_TABLE.lock();
+        let (parent_name, parent_entry, parent_fd) = {
+            let parent = table.get_mut(parent_pid).unwrap();
+            (parent.name, parent.entry_point, parent.fd_table)
+        };
+        let pid = table.alloc(parent_pid, b"fork");
+        if pid == 0 {
+            return Errno::enomem.as_i64();
+        }
+        let slot = table
+            .processes
+            .iter()
+            .position(|p| p.pid == pid)
+            .unwrap();
+        {
+            let proc = table.get_mut(pid).unwrap();
+            proc.entry_point = parent_entry;
+            proc.user_rsp = ctx.rsp;
+            proc.cr3 = child_cr3;
+            proc.fd_table = parent_fd;
+            proc.set_name(&parent_name);
+            proc.state = crate::process::ProcessState::Ready;
+        }
+        (pid, slot)
+    };
+
+    // 3. Build the child's kernel stack: switch_context returns at
+    //    syscall_trampoline_after_call, which pops the GPRs and iretq's
+    //    back to user mode right after the int 0x80, rax = 0.
+    {
+        let mut stacks = crate::scheduler::KERNEL_STACKS.lock();
+        let stack = &mut stacks[child_slot];
+        let top = stack.stack_top();
+        let mut sp = top as *mut u64;
+
+        // CPU-pushed frame (iretq pops RIP, CS, RFLAGS, RSP, SS; memory
+        // low→high is RIP, CS, RFLAGS, RSP, SS — write high→low).
+        sp = sp.sub(1);
+        *sp = ctx.ss;
+        sp = sp.sub(1);
+        *sp = ctx.rsp;
+        sp = sp.sub(1);
+        *sp = ctx.rflags;
+        sp = sp.sub(1);
+        *sp = ctx.cs;
+        sp = sp.sub(1);
+        *sp = ctx.rip;
+
+        // GPR save area. The trampoline pops r15..rax in that order, so
+        // memory low→high is r15..rax. Write high→low (rax first).
+        let gprs = [
+            ctx.r15, ctx.r14, ctx.r13, ctx.r12, ctx.r11, ctx.r10, ctx.r9,
+            ctx.r8, ctx.rbp, ctx.rdi, ctx.rsi, ctx.rdx, ctx.rcx, ctx.rbx,
+            0u64, // rax = 0 → child sees fork() == 0
+        ];
+        for reg in gprs.iter().rev() {
+            sp = sp.sub(1);
+            *sp = *reg;
+        }
+
+        // Callee-saved block + return address for switch_context
+        // (pop order r15, r14, r13, r12, rbx, rbp, then ret).
+        let after_call =
+            crate::syscall_trampoline::syscall_trampoline_after_call as *const () as u64;
+        sp = sp.sub(1);
+        *sp = after_call; // ret target
+        sp = sp.sub(1);
+        *sp = 0; // rbp
+        sp = sp.sub(1);
+        *sp = 0; // rbx
+        sp = sp.sub(1);
+        *sp = 0; // r12
+        sp = sp.sub(1);
+        *sp = 0; // r13
+        sp = sp.sub(1);
+        *sp = 0; // r14
+        sp = sp.sub(1);
+        *sp = 0; // r15 (lowest address → saved_rsp)
+
+        stack.saved_rsp = sp as u64;
+        stack.initialised = true;
+    }
+
+    crate::serial::_print(format_args!(
+        "[fork] pid={} → child pid={}, cr3={:#x}\n",
+        parent_pid, child_pid, child_cr3
+    ));
+
+    // The parent returns the child's PID.
+    child_pid as i64
+}
+
+/// `waitpid(pid, status_ptr)` → reaped child PID on success.
+///
+/// pid = -1 (u64::MAX) waits for any child. While the child is still
+/// running the calling process yields via `hlt`; the timer interrupt
+/// keeps the scheduler running other processes, and we are switched back
+/// when our slice returns.
+unsafe fn sys_waitpid(pid: u64, status_ptr: u64) -> i64 {
+    loop {
+        let (current, result) = {
+            let table = crate::process::PROCESS_TABLE.lock();
+            let current = table.current_pid;
+            let mut result: Option<(u32, i32, bool)> = None;
+            for p in table.processes.iter() {
+                if p.pid != 0 && p.parent_pid == current {
+                    if pid == u64::MAX || p.pid as u64 == pid {
+                        result = Some((
+                            p.pid,
+                            p.exit_code,
+                            p.state == crate::process::ProcessState::Zombie,
+                        ));
+                        break;
+                    }
+                }
+            }
+            (current, result)
+        };
+
+        match result {
+            Some((child_pid, code, true)) => {
+                if status_ptr != 0 {
+                    *(status_ptr as *mut i32) = code;
+                }
+                crate::process::PROCESS_TABLE.lock().free(child_pid);
+                crate::serial::_print(format_args!(
+                    "[waitpid] pid={} reaped child {} (exit {})\n",
+                    current, child_pid, code
+                ));
+                return child_pid as i64;
+            }
+            Some(_) => {
+                // Child still alive: yield to the scheduler so other
+                // processes can run. A bare hlt would NOT reschedule —
+                // the scheduler only switches when the slice expires or
+                // the current process dies.
+                crate::scheduler::yield_now();
+            }
+            None => {
+                // No such child.
+                return -10; // ECHILD
+            }
+        }
+    }
+}
+
+/// `getppid()` → parent process ID (0 = kernel).
+unsafe fn sys_getppid() -> i64 {
+    let table = crate::process::PROCESS_TABLE.lock();
+    let current = table.current_pid;
+    if current == 0 {
+        return 0;
+    }
+    table.get(current).map_or(0, |p| p.parent_pid as i64)
 }
 
 

@@ -16,7 +16,7 @@
 //! - User-mode signal handler invocation
 //! - Signal-safe syscall restart
 
-use crate::process::{ProcessState, PROCESS_TABLE};
+use crate::process::{ProcessState, ProcessTable, PROCESS_TABLE};
 
 /// Signal numbers (minimal subset).
 pub const SIGKILL: u8 = 9;
@@ -61,53 +61,61 @@ pub fn send_signal(pid: u32, signum: u8) -> bool {
 
 /// Deliver pending signals to the currently running process.
 ///
-/// Called from the timer interrupt handler before context switching.
+/// Called from the scheduler's timer path before a context switch.
+/// This variant takes an already-locked process table so the caller
+/// can combine delivery + zombie checks under a single lock.
 ///
 /// [MANUAL] Full delivery requires injecting a signal frame on the
 /// user-mode stack and jumping to the signal handler. For now,
 /// we just process SIGKILL/SIGTERM (mark as zombie).
-pub fn deliver_pending() {
-    let mut table = PROCESS_TABLE.lock();
+pub fn deliver_pending_into(table: &mut ProcessTable) {
     let current = table.current_pid;
-
     if current == 0 {
         return; // Kernel mode, no signal delivery.
     }
-
-    if let Some(proc) = table.get_mut(current) {
-        let pending = proc.pending_signals;
-        if pending == 0 {
-            return;
-        }
-
-        // Check SIGKILL (bit 8).
-        if (pending & (1 << (SIGKILL - 1))) != 0 {
-            crate::serial::_print(format_args!(
-                "[signal] delivering SIGKILL to pid={}\n", current
-            ));
-            proc.fd_table.clear();
-            proc.pending_signals = 0;
-            proc.state = ProcessState::Zombie;
-            proc.exit_code = 128 + SIGKILL as i32;
-            return;
-        }
-
-        // Check SIGTERM (bit 14).
-        if (pending & (1 << (SIGTERM - 1))) != 0 {
-            crate::serial::_print(format_args!(
-                "[signal] delivering SIGTERM to pid={}\n", current
-            ));
-            proc.fd_table.clear();
-            proc.pending_signals = 0;
-            proc.state = ProcessState::Zombie;
-            proc.exit_code = 128 + SIGTERM as i32;
-            return;
-        }
-
-        // [MANUAL] Other signals need full signal frame delivery.
-        // Clear pending non-termination signals (can't deliver yet).
-        proc.pending_signals &= !((1 << (SIGKILL - 1)) | (1 << (SIGTERM - 1)));
+    let Some(proc) = table.get_mut(current) else {
+        return;
+    };
+    let pending = proc.pending_signals;
+    if pending == 0 {
+        return;
     }
+
+    // Check SIGKILL (bit 8).
+    if (pending & (1 << (SIGKILL - 1))) != 0 {
+        crate::serial::_print(format_args!(
+            "[signal] delivering SIGKILL to pid={}\n", current
+        ));
+        proc.fd_table.clear();
+        proc.pending_signals = 0;
+        proc.state = ProcessState::Zombie;
+        proc.exit_code = 128 + SIGKILL as i32;
+        return;
+    }
+
+    // Check SIGTERM (bit 14).
+    if (pending & (1 << (SIGTERM - 1))) != 0 {
+        crate::serial::_print(format_args!(
+            "[signal] delivering SIGTERM to pid={}\n", current
+        ));
+        proc.fd_table.clear();
+        proc.pending_signals = 0;
+        proc.state = ProcessState::Zombie;
+        proc.exit_code = 128 + SIGTERM as i32;
+        return;
+    }
+
+    // [MANUAL] Other signals need full signal frame delivery.
+    // Clear pending non-termination signals (can't deliver yet).
+    proc.pending_signals &= !((1 << (SIGKILL - 1)) | (1 << (SIGTERM - 1)));
+}
+
+/// Deliver pending signals to the currently running process.
+///
+/// Locking wrapper around `deliver_pending_into`.
+pub fn deliver_pending() {
+    let mut table = PROCESS_TABLE.lock();
+    deliver_pending_into(&mut table);
 }
 
 /// `kill(pid, signum)` → 0 on success, negative errno on failure.

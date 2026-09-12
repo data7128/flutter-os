@@ -127,25 +127,133 @@ impl AddressSpace {
         let new_pml4 = unsafe { &mut *(pml4_virt.as_mut_ptr::<PageTable>()) };
 
         // Copy the kernel's PML4 entries into the new user address space.
-        // The bootloader maps the kernel at 0x8000_0000_0000, which lives
-        // in PML4 index 4 — NOT the conventional higher-half (index
-        // 256..512) — so we copy the entire table. User pages are added
-        // afterwards by map_user_page; supervisor PTE flags keep kernel
-        // memory inaccessible from Ring3.
+        //
+        // The bootloader maps the kernel at 0x8000_0000_0000 — that is
+        // 512 GiB, PML4 index 1 — and the physical-memory window at
+        // 0x200_0000_0000 (2 TiB, PML4 index 4). We copy indices 1..512
+        // so syscalls/interrupts can reach kernel code, data and the
+        // per-process kernel stacks (all in the higher region).
+        //
+        // Index 0 (the user region, 0 .. 512 GiB) is intentionally NOT
+        // copied: copying it would share the kernel's intermediate page
+        // tables (bootloader stack, identity map), and mapping a user
+        // page would then mutate the kernel's tables — the second
+        // process to load at the same virtual address (e.g. 0x400000)
+        // would collide with the first process's leftover mapping.
         let kernel_pml4_phys = x86_64::registers::control::Cr3::read().0.start_address();
         let kernel_pml4_virt = VirtAddr::new(phys_offset + kernel_pml4_phys.as_u64());
         let kernel_pml4 = unsafe { &*(kernel_pml4_virt.as_ptr::<PageTable>()) };
 
-        for i in 0..512 {
+        for i in 1..512 {
             new_pml4[i] = kernel_pml4[i].clone();
         }
 
+        Ok(Self { pml4_frame })
+    }
+
+    /// Wrap an existing PML4 frame (e.g. a process's cr3) as an
+    /// address space handle.
+    pub fn from_cr3(cr3: u64) -> Option<Self> {
+        if cr3 == 0 {
+            return None;
+        }
+        let frame = PhysFrame::<Size4KiB>::from_start_address(PhysAddr::new(cr3)).ok()?;
+        Some(Self { pml4_frame: frame })
+    }
+
+    /// Deep-copy the user portion (PML4 entries 0..256) of this address
+    /// space into a fresh one. Every present user page gets its own
+    /// physical frame with the same contents and flags; kernel entries
+    /// are re-copied by `new_user`.
+    ///
+    /// Used by `fork` so the child sees an identical user memory image.
+    /// Copy-on-write is a future optimisation.
+    pub fn clone_user_space(&self) -> Result<Self, &'static str> {
+        let new = Self::new_user()?;
+        let phys_offset = *PHYSICAL_OFFSET.lock();
+
+        // Deep-copy the user portion of this address space into a fresh
+        // one. User memory lives entirely in PML4 index 0 (0 .. 512 GiB;
+        // ELF at 0x400000, stack at 0x7fff_0000_0000). Index 1..511 is
+        // the kernel region (code at 0x8000_0000_0000, phys window at
+        // 0x200_0000_0000) and is copied by `new_user` — deep-copying it
+        // here would exhaust the frame allocator.
+        let src_pml4_virt = VirtAddr::new(phys_offset + self.pml4_frame.start_address().as_u64());
+        let src_pml4 = unsafe { &*(src_pml4_virt.as_ptr::<PageTable>()) };
+
+        for pml4_idx in 0..1 {
+            let l4 = src_pml4[pml4_idx].clone();
+            if !l4.flags().contains(PageTableFlags::PRESENT) {
+                continue;
+            }
+            if l4.flags().contains(PageTableFlags::HUGE_PAGE) {
+                return Err("1GiB huge page in user space");
+            }
+            let pdpt_frame = l4.frame().map_err(|_| "l4 entry without frame")?;
+            let pdpt_virt = VirtAddr::new(phys_offset + pdpt_frame.start_address().as_u64());
+            let pdpt = unsafe { &*(pdpt_virt.as_ptr::<PageTable>()) };
+
+            for pdpt_idx in 0..512 {
+                let l3 = pdpt[pdpt_idx].clone();
+                if !l3.flags().contains(PageTableFlags::PRESENT) {
+                    continue;
+                }
+                if l3.flags().contains(PageTableFlags::HUGE_PAGE) {
+                    return Err("1GiB huge page in user space");
+                }
+                let pd_frame = l3.frame().map_err(|_| "l3 entry without frame")?;
+                let pd_virt = VirtAddr::new(phys_offset + pd_frame.start_address().as_u64());
+                let pd = unsafe { &*(pd_virt.as_ptr::<PageTable>()) };
+
+                for pd_idx in 0..512 {
+                    let l2 = pd[pd_idx].clone();
+                    if !l2.flags().contains(PageTableFlags::PRESENT) {
+                        continue;
+                    }
+                    if l2.flags().contains(PageTableFlags::HUGE_PAGE) {
+                        return Err("2MiB huge page in user space");
+                    }
+                    let pt_frame = l2.frame().map_err(|_| "l2 entry without frame")?;
+                    let pt_virt = VirtAddr::new(phys_offset + pt_frame.start_address().as_u64());
+                    let pt = unsafe { &*(pt_virt.as_ptr::<PageTable>()) };
+
+                    for pt_idx in 0..512 {
+                        let l1 = pt[pt_idx].clone();
+                        if !l1.flags().contains(PageTableFlags::PRESENT)
+                            || !l1.flags().contains(PageTableFlags::USER_ACCESSIBLE)
+                        {
+                            continue;
+                        }
+                        let src_frame = l1.frame().map_err(|_| "l1 entry without frame")?;
+
+                        let vaddr = (pml4_idx as u64) << 39
+                            | (pdpt_idx as u64) << 30
+                            | (pd_idx as u64) << 21
+                            | (pt_idx as u64) << 12;
+                        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(vaddr));
+
+                        // Allocate a fresh frame in the new space and
+                        // copy the page contents.
+                        let dst_frame = new.map_user_page_alloc(page, l1.flags())?;
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                (phys_offset + src_frame.start_address().as_u64()) as *const u8,
+                                (phys_offset + dst_frame.start_address().as_u64()) as *mut u8,
+                                4096,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         crate::serial::_print(format_args!(
-            "[addrspace] new user PML4 at phys={:#x}\n",
-            pml4_frame.start_address().as_u64()
+            "[addrspace] cloned user space {:#x} → {:#x}\n",
+            self.pml4_frame.start_address().as_u64(),
+            new.pml4_frame.start_address().as_u64()
         ));
 
-        Ok(Self { pml4_frame })
+        Ok(new)
     }
 
     /// Switch to this address space (write CR3).
@@ -195,8 +303,24 @@ impl AddressSpace {
         page: Page<Size4KiB>,
         flags: PageTableFlags,
     ) -> Result<PhysFrame<Size4KiB>, &'static str> {
-        let frame = crate::memory::frame_allocator::alloc_frame().ok_or("out of physical frames")?;
-        self.map_user_page(page, frame, flags)?;
+        let frame = match crate::memory::frame_allocator::alloc_frame() {
+            Some(f) => f,
+            None => {
+                crate::serial::_print(format_args!(
+                    "[addrspace] out of physical frames (page {:#x})\n",
+                    page.start_address().as_u64()
+                ));
+                return Err("out of physical frames");
+            }
+        };
+        if let Err(e) = self.map_user_page(page, frame, flags) {
+            crate::serial::_print(format_args!(
+                "[addrspace] map_user_page failed for {:#x}: {}\n",
+                page.start_address().as_u64(),
+                e
+            ));
+            return Err(e);
+        }
         Ok(frame)
     }
 }

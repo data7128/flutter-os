@@ -47,6 +47,13 @@ syscall_trampoline:
     mov rdi, rsp
     call syscall_dispatch
 
+    // `syscall_trampoline_after_call` is the resume point for a forked
+    // child: its kernel stack is constructed so that switch_context
+    // returns here, then the pop/iretq sequence below lands the child
+    // back in Ring3 right after the int 0x80 with rax = 0 (fork's
+    // child return value).
+.global syscall_trampoline_after_call
+syscall_trampoline_after_call:
     // Restore all GPRs (rax now holds the return value).
     pop r15
     pop r14
@@ -71,6 +78,10 @@ syscall_trampoline:
 
 extern "C" {
     pub fn syscall_trampoline();
+    /// Resume point inside the trampoline right after the dispatch call.
+    /// Fork uses this address to set up the child's kernel stack so the
+    /// child resumes like the parent did, with rax = 0.
+    pub fn syscall_trampoline_after_call();
 }
 
 // ── Saved interrupt context ────────────────────────────────────────────
@@ -121,7 +132,8 @@ pub extern "C" fn syscall_dispatch(ctx: &mut InterruptContext) {
     let arg4 = ctx.r8;
     let arg5 = ctx.r9;
 
-    let retval = crate::syscalls::dispatch(num, arg0, arg1, arg2, arg3, arg4, arg5);
+    let retval =
+        crate::syscalls::dispatch(num, arg0, arg1, arg2, arg3, arg4, arg5, ctx as *mut _);
     ctx.rax = retval as u64;
 }
 

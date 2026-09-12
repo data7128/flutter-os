@@ -95,13 +95,14 @@ extern "x86-interrupt" fn page_fault_handler(
         accessed_addr, error_code, stack_frame
     );
 
-    // If the fault came from user mode (CS RPL = 3), deliver SIGSEGV.
+    // If the fault came from user mode (CS RPL = 3), deliver SIGSEGV:
+    // kill the current process and let the scheduler move on.
     let cs = stack_frame.code_segment;
     if cs.rpl() == x86_64::PrivilegeLevel::Ring3 {
         println!("[int] page fault in user mode — killing current process");
         let pid = crate::process::PROCESS_TABLE.lock().current_pid;
         crate::process::PROCESS_TABLE.lock().mark_exit(pid, 139); // SIGSEGV = 139
-        // TODO: switch to next runnable process via scheduler.
+        crate::scheduler::switch_to_next();
         crate::hlt_loop();
     }
 
@@ -146,8 +147,10 @@ extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFr
     // Increment the kernel tick counter.
     crate::syscalls::time::on_timer_tick();
 
-    // Preemptive scheduling: the scheduler's on_timer_tick decrements
-    // the current process's time slice and may trigger a context switch.
+    // Preemptive scheduling + signal delivery. The scheduler's
+    // on_timer_tick decrements the current process's time slice, delivers
+    // pending signals (kill → zombie) and triggers a context switch when
+    // the slice is up or the current process died.
     crate::scheduler::on_timer_tick();
 
     unsafe {
