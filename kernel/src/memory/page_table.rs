@@ -145,7 +145,18 @@ impl AddressSpace {
         let kernel_pml4 = unsafe { &*(kernel_pml4_virt.as_ptr::<PageTable>()) };
 
         for i in 1..512 {
-            new_pml4[i] = kernel_pml4[i].clone();
+            let e = kernel_pml4[i].clone();
+            if !e.flags().contains(PageTableFlags::PRESENT) {
+                continue;
+            }
+            if e.flags().contains(PageTableFlags::USER_ACCESSIBLE) {
+                // User region (e.g. the user stack at PML4 index 255).
+                // Never inherit another process's user mapping here: new
+                // user mappings are created by map_user_page, and fork
+                // deep-copies them via clone_user_space.
+                continue;
+            }
+            new_pml4[i] = e;
         }
 
         Ok(Self { pml4_frame })
@@ -181,9 +192,14 @@ impl AddressSpace {
         let src_pml4_virt = VirtAddr::new(phys_offset + self.pml4_frame.start_address().as_u64());
         let src_pml4 = unsafe { &*(src_pml4_virt.as_ptr::<PageTable>()) };
 
-        for pml4_idx in 0..1 {
+        for pml4_idx in 0..512 {
             let l4 = src_pml4[pml4_idx].clone();
             if !l4.flags().contains(PageTableFlags::PRESENT) {
+                continue;
+            }
+            if !l4.flags().contains(PageTableFlags::USER_ACCESSIBLE) {
+                // Kernel region (higher-half, phys window): shared, not
+                // copied per-process.
                 continue;
             }
             if l4.flags().contains(PageTableFlags::HUGE_PAGE) {

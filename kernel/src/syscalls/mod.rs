@@ -1173,7 +1173,6 @@ unsafe fn sys_fork(ctx: *mut crate::syscall_trampoline::InterruptContext) -> i64
         stack.saved_rsp = sp as u64;
         stack.initialised = true;
     }
-
     crate::serial::_print(format_args!(
         "[fork] pid={} → child pid={}, cr3={:#x}\n",
         parent_pid, child_pid, child_cr3
@@ -1209,7 +1208,6 @@ unsafe fn sys_waitpid(pid: u64, status_ptr: u64) -> i64 {
             }
             (current, result)
         };
-
         match result {
             Some((child_pid, code, true)) => {
                 if status_ptr != 0 {
