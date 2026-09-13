@@ -173,17 +173,24 @@ impl ProcessTable {
             if self.processes[i].pid == 0 {
                 let pid = self.next_pid;
                 self.next_pid += 1;
-                self.processes[i] = Process {
-                    pid,
-                    parent_pid,
-                    // Fresh slots are not runnable until a spawn path
-                    // (exec / spawn_user_process) sets up their kernel
-                    // stack and flips the state to Ready. Keeping them
-                    // Blocked prevents the scheduler from selecting
-                    // placeholders (e.g. boot_service stubs) forever.
-                    state: ProcessState::Blocked,
-                    ..Process::empty()
-                };
+                // Field-by-field initialisation (avoids a large 4 KiB
+                // stack temporary + struct copy that previously aliased
+                // kernel-stack metadata).
+                {
+                    let p = &mut self.processes[i];
+                    p.pid = pid;
+                    p.parent_pid = parent_pid;
+                    p.state = ProcessState::Blocked;
+                    p.context = SavedContext::zero();
+                    p.entry_point = 0;
+                    p.user_rsp = 0;
+                    p.cr3 = 0;
+                    p.fd_table = FdTable::new();
+                    p.pending_signals = 0;
+                    p.signal_mask = 0;
+                    p.exit_code = 0;
+                    p.name = [0; 16];
+                }
                 self.processes[i].set_name(name);
                 return pid;
             }

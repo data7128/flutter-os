@@ -326,7 +326,8 @@ unsafe fn sys_open(path: *const u8, flags: u32) -> i64 {
 /// `read(fd, buf, count)` → bytes_read (≥0) or negative errno.
 ///
 /// Currently supports:
-/// - fd=0 (stdin): read from PS/2 keyboard scancode buffer (non-blocking)
+/// - fd=0 (stdin): blocking read from the COM1 serial console (the
+///   host terminal under `qemu -serial stdio`).
 ///
 /// ← FUTURE: support file-backed FDs from FAT32.
 unsafe fn sys_read(fd: i32, buf: *mut u8, count: u64) -> i64 {
@@ -335,14 +336,25 @@ unsafe fn sys_read(fd: i32, buf: *mut u8, count: u64) -> i64 {
     }
     match fd {
         0 => {
-            // stdin: drain PS/2 keyboard scancode buffer
+            // stdin: block until at least one byte arrives, then drain
+            // whatever else is already buffered. Yields so other
+            // processes keep running while we wait for input.
             let mut read = 0u64;
-            while read < count {
-                if let Some(sc) = crate::interrupts::SCANCODE_BUFFER.lock().pop() {
-                    *buf.add(read as usize) = sc;
+            loop {
+                if let Some(b) = crate::serial::try_read_byte() {
+                    *buf.add(read as usize) = b;
                     read += 1;
-                } else {
                     break;
+                }
+                crate::scheduler::yield_now();
+            }
+            while read < count {
+                match crate::serial::try_read_byte() {
+                    Some(b) => {
+                        *buf.add(read as usize) = b;
+                        read += 1;
+                    }
+                    None => break,
                 }
             }
             read as i64
@@ -1090,6 +1102,7 @@ unsafe fn sys_fork(ctx: *mut crate::syscall_trampoline::InterruptContext) -> i64
     let child_cr3 = child_as.pml4_frame.start_address().as_u64();
 
     // 2. Allocate the child slot and copy parent fields.
+    x86_64::instructions::interrupts::disable();
     let (child_pid, child_slot) = {
         let mut table = crate::process::PROCESS_TABLE.lock();
         let (parent_name, parent_entry, parent_fd) = {
@@ -1116,6 +1129,7 @@ unsafe fn sys_fork(ctx: *mut crate::syscall_trampoline::InterruptContext) -> i64
         }
         (pid, slot)
     };
+    x86_64::instructions::interrupts::enable();
 
     // 3. Build the child's kernel stack: switch_context returns at
     //    syscall_trampoline_after_call, which pops the GPRs and iretq's
@@ -1173,11 +1187,6 @@ unsafe fn sys_fork(ctx: *mut crate::syscall_trampoline::InterruptContext) -> i64
         stack.saved_rsp = sp as u64;
         stack.initialised = true;
     }
-    crate::serial::_print(format_args!(
-        "[fork] pid={} → child pid={}, cr3={:#x}\n",
-        parent_pid, child_pid, child_cr3
-    ));
-
     // The parent returns the child's PID.
     child_pid as i64
 }
@@ -1190,7 +1199,7 @@ unsafe fn sys_fork(ctx: *mut crate::syscall_trampoline::InterruptContext) -> i64
 /// when our slice returns.
 unsafe fn sys_waitpid(pid: u64, status_ptr: u64) -> i64 {
     loop {
-        let (current, result) = {
+        let result = {
             let table = crate::process::PROCESS_TABLE.lock();
             let current = table.current_pid;
             let mut result: Option<(u32, i32, bool)> = None;
@@ -1206,7 +1215,7 @@ unsafe fn sys_waitpid(pid: u64, status_ptr: u64) -> i64 {
                     }
                 }
             }
-            (current, result)
+            result
         };
         match result {
             Some((child_pid, code, true)) => {
@@ -1214,10 +1223,6 @@ unsafe fn sys_waitpid(pid: u64, status_ptr: u64) -> i64 {
                     *(status_ptr as *mut i32) = code;
                 }
                 crate::process::PROCESS_TABLE.lock().free(child_pid);
-                crate::serial::_print(format_args!(
-                    "[waitpid] pid={} reaped child {} (exit {})\n",
-                    current, child_pid, code
-                ));
                 return child_pid as i64;
             }
             Some(_) => {

@@ -23,3 +23,21 @@ pub fn _print(args: fmt::Arguments) {
     use core::fmt::Write;
     let _ = COM1.lock().write_fmt(args);
 }
+
+/// Non-blocking read from COM1: returns the next byte if the receiver
+/// holds data, or `None` if the FIFO is empty. Used as the stdin source
+/// for Ring3 processes (`read(0, ...)`) so the shell can take commands
+/// typed on the host terminal (`qemu -serial stdio`).
+pub fn try_read_byte() -> Option<u8> {
+    use x86_64::instructions::port::Port;
+    // Line Status Register (COM1+5): bit 0 = Data Ready.
+    let mut lsr = Port::<u8>::new(0x3FD);
+    let status = unsafe { lsr.read() };
+    if status & 0x01 != 0 {
+        // Receiver Buffer Register (COM1+0).
+        let mut rbr = Port::<u8>::new(0x3F8);
+        Some(unsafe { rbr.read() })
+    } else {
+        None
+    }
+}

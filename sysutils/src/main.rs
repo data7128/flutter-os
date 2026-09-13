@@ -73,8 +73,8 @@ pub extern "C" fn aero_main(argc: u64, argv: *const *const u8) -> i32 {
     let argv_slice = &args[..n];
 
     if argv_slice.len() < 2 {
-        // No command given (kernel boot): run the demo.
-        return demo();
+        // No command given (kernel boot): start the interactive shell.
+        return shell();
     }
 
     let cmd = argv_slice[1];
@@ -104,41 +104,115 @@ pub extern "C" fn aero_main(argc: u64, argv: *const *const u8) -> i32 {
     }
 }
 
-/// Boot demo (no argv): prove the user-mode stack works end to end —
-/// list the root directory, then fork+exec `/bin/hello` and reap it.
-fn demo() -> i32 {
-    let pid = syscalls::getpid();
-    syscalls::print_str("=== AeroOS sysutils in Ring3 (pid=");
-    syscalls::print_u64(pid as u64);
-    syscalls::println(") ===");
+/// Interactive shell: print a prompt, read one line from stdin, split it
+/// into tokens and dispatch to a builtin command — or fork+exec an
+/// external program from /bin.
+fn shell() -> i32 {
+    loop {
+        syscalls::print_str("$ ");
+        let mut line: [u8; 256] = [0; 256];
+        let mut n = 0usize;
+        loop {
+            let mut b = [0u8; 1];
+            let r = syscalls::read(0, &mut b);
+            if r <= 0 {
+                syscalls::println("");
+                return 0;
+            }
+            let c = b[0];
+            if c == b'\n' || c == b'\r' {
+                syscalls::println("");
+                break;
+            }
+            if c == 0x08 || c == 0x7f {
+                // Backspace.
+                if n > 0 {
+                    n -= 1;
+                    syscalls::print_str("\x08 \x08");
+                }
+                continue;
+            }
+            if n < line.len() - 1 {
+                line[n] = c;
+                n += 1;
+                // Local echo so the line is visible on the terminal.
+                syscalls::print_str(core::str::from_utf8(&[c]).unwrap_or("."));
+            }
+        }
 
-    syscalls::println("--- ls / ---");
-    commands::ls::run(b"/");
+        // Tokenise on spaces.
+        let mut toks: [&[u8]; 16] = [b""; 16];
+        let mut nt = 0usize;
+        let mut i = 0usize;
+        while i < n && nt < toks.len() {
+            while i < n && line[i] == b' ' {
+                i += 1;
+            }
+            let start = i;
+            while i < n && line[i] != b' ' {
+                i += 1;
+            }
+            if i > start {
+                toks[nt] = &line[start..i];
+                nt += 1;
+            }
+        }
+        if nt == 0 {
+            continue;
+        }
 
-    syscalls::println("--- fork + exec(/bin/hello) + waitpid ---");
+        let cmd = toks[0];
+        if eq(cmd, b"exit") || eq(cmd, b"quit") {
+            syscalls::println("bye");
+            return 0;
+        } else if eq(cmd, b"help") {
+            syscalls::println("commands: ls [path], ps, cat <path>, kill <pid>, hello, forktest, help, exit");
+        } else if eq(cmd, b"ls") {
+            commands::ls::run(toks.get(1).copied().unwrap_or(b"/"));
+        } else if eq(cmd, b"cat") {
+            if nt < 2 {
+                syscalls::println("cat: missing file path");
+            } else {
+                commands::cat::run(toks[1]);
+            }
+        } else if eq(cmd, b"ps") {
+            commands::ps::run();
+        } else if eq(cmd, b"kill") {
+            if nt < 2 {
+                syscalls::println("kill: missing PID");
+            } else {
+                commands::kill::run(toks[1]);
+            }
+        } else if eq(cmd, b"hello") {
+            run_external(b"/bin/hello");
+        } else if eq(cmd, b"forktest") {
+            run_external(b"/bin/forktest");
+        } else {
+            syscalls::print_str("sysutils: unknown command: ");
+            syscalls::print_str(core::str::from_utf8(cmd).unwrap_or("?"));
+            syscalls::println(" (try: help)");
+        }
+    }
+}
+
+/// Fork, exec an external program and wait for it to finish.
+fn run_external(path: &[u8]) {
     let r = syscalls::fork();
     if r == 0 {
-        // Child: replace itself with /bin/hello.
-        let e = syscalls::exec(b"/bin/hello", core::ptr::null());
-        syscalls::print_str("exec failed: ");
-        syscalls::print_i64(e);
-        syscalls::println("");
-        syscalls::exit(1);
+        let e = syscalls::exec(path, core::ptr::null());
+        if e < 0 {
+            syscalls::print_str("exec failed: ");
+            syscalls::print_i64(e);
+            syscalls::println("");
+            syscalls::exit(127);
+        }
     } else if r > 0 {
         let mut status: i32 = 0;
-        let _w = syscalls::waitpid(r, &mut status);
-        syscalls::print_str("--- child exited, status=");
-        syscalls::print_i64(status as i64);
-        syscalls::println(" ---");
-
-        syscalls::println("--- ps ---");
-        commands::ps::run();
-        0
+        syscalls::waitpid(r, &mut status);
     } else {
         syscalls::print_str("fork failed: ");
         syscalls::print_i64(r);
         syscalls::println("");
-        1
     }
 }
 

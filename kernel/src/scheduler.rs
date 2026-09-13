@@ -199,7 +199,10 @@ fn find_slot(pid: u32) -> Option<usize> {
 /// and try again on the next one.
 pub fn on_timer_tick() {
     let need_resched = {
-        let mut sched = SCHEDULER.lock();
+        let mut sched = match SCHEDULER.try_lock() {
+            Some(s) => s,
+            None => return, // main line holds the scheduler lock — skip this tick
+        };
         if !sched.active {
             return;
         }
@@ -236,7 +239,12 @@ pub fn on_timer_tick() {
 /// Find the next runnable (Ready) process, scanning forward from
 /// `after_pid`'s slot with wraparound. Returns None if nothing is runnable.
 fn find_next_ready(after_pid: u32) -> Option<u32> {
-    let table = PROCESS_TABLE.lock();
+    let table = match PROCESS_TABLE.try_lock() {
+        Some(t) => t,
+        None => {
+            return None;
+        }
+    };
     let current_slot = table
         .processes
         .iter()
@@ -258,7 +266,10 @@ fn find_next_ready(after_pid: u32) -> Option<u32> {
 /// Round-robin: scan from the current PID forward, wrap around, and
 /// pick the first process in `Ready` state.
 pub fn schedule() {
-    let current_pid = PROCESS_TABLE.lock().current_pid;
+    let current_pid = match PROCESS_TABLE.try_lock() {
+        Some(t) => t.current_pid,
+        None => return, // interrupt reentry while the table is busy — skip
+    };
     let next_pid = find_next_ready(current_pid);
 
     let next_pid = match next_pid {
@@ -282,7 +293,13 @@ pub fn schedule() {
 /// killed) to the next runnable one. If nothing else is runnable, this
 /// returns and the caller should idle until the next timer tick.
 pub fn switch_to_next() {
-    let current = PROCESS_TABLE.lock().current_pid;
+    let current = match PROCESS_TABLE.try_lock() {
+        Some(t) => t.current_pid,
+        None => {
+            crate::serial::_print(format_args!("[stn-lockbusy] switch_to_next\n"));
+            return;
+        }
+    };
     let next = find_next_ready(current);
     if let Some(next_pid) = next {
         if next_pid != current {
@@ -321,30 +338,50 @@ pub fn restart_current() {
 fn do_context_switch(old_pid: u32, new_pid: u32) {
     let new_slot = match find_slot(new_pid) {
         Some(s) => s,
-        None => return,
+        None => {
+            return;
+        }
     };
     let old_slot = if old_pid == 0 { None } else { find_slot(old_pid) };
 
-    let mut stacks = KERNEL_STACKS.lock();
-
+    let mut stacks = match KERNEL_STACKS.try_lock() {
+        Some(g) => g,
+        None => {
+            return;
+        }
+    };
     // Ensure the new process has an initial context.
     if !stacks[new_slot].initialised {
+        for (i, st) in stacks.iter().enumerate() {
+            crate::serial::_print(format_args!(
+                "  st{} init={} saved_rsp={:#x}\n", i, st.initialised, st.saved_rsp
+            ));
+        }
+        {
+            let tbl = crate::process::PROCESS_TABLE.lock();
+            for (i, p) in tbl.processes.iter().enumerate() {
+                if p.pid != 0 {
+                    crate::serial::_print(format_args!(
+                        "  proc slot{} pid={} state={}\n", i, p.pid, p.state as u32
+                    ));
+                }
+            }
+        }
         // The entry point for a fresh process is `trampoline_to_user`,
         // which does the iretq to Ring3. We set it up when the process
         // is created, but if not, skip. Mark it Blocked so the next
         // scan doesn't pick the same placeholder again and spin.
         {
-            let mut table = PROCESS_TABLE.lock();
+            let mut table = match PROCESS_TABLE.try_lock() {
+                Some(t) => t,
+                None => return,
+            };
             if let Some(p) = table.get_mut(new_pid) {
                 if p.state == ProcessState::Ready {
                     p.state = ProcessState::Blocked;
                 }
             }
         }
-        crate::serial::_print(format_args!(
-            "[sched] new process pid={} has no initial context — skipping\n",
-            new_pid
-        ));
         return;
     }
 
@@ -361,7 +398,12 @@ fn do_context_switch(old_pid: u32, new_pid: u32) {
 
     // Update process states.
     {
-        let mut table = PROCESS_TABLE.lock();
+        let mut table = match PROCESS_TABLE.try_lock() {
+            Some(t) => t,
+            None => {
+                return;
+            }
+        };
         if let Some(_) = old_slot {
             if let Some(p) = table.get_mut(old_pid) {
                 if p.state == ProcessState::Running {
@@ -378,7 +420,12 @@ fn do_context_switch(old_pid: u32, new_pid: u32) {
     // Reset time slice. (Single lock acquisition — spin locks are not
     // re-entrant, and the old `lock().x = lock().y` form deadlocked here.)
     {
-        let mut sched = SCHEDULER.lock();
+        let mut sched = match SCHEDULER.try_lock() {
+            Some(s) => s,
+            None => {
+                return;
+            }
+        };
         sched.current_slice = sched.default_slice;
     }
 
@@ -394,7 +441,12 @@ fn do_context_switch(old_pid: u32, new_pid: u32) {
     // switching CR3 while still on the old (bootloader, low-region)
     // stack would fault, because user PML4s only map the higher half.
     let new_cr3 = {
-        let table = PROCESS_TABLE.lock();
+        let table = match PROCESS_TABLE.try_lock() {
+            Some(t) => t,
+            None => {
+                return;
+            }
+        };
         table.get(new_pid).map_or(0, |p| p.cr3)
     };
 
